@@ -19,6 +19,7 @@ __author__ = 'pts@fazekas.hu (Peter Szabo)'
 
 import errno
 import fcntl
+import hmac
 import getpass
 import os
 import os.path
@@ -36,7 +37,20 @@ try:
 except (ImportError, AttributeError):
   from sha import sha as sha1
 
-HEADER_START = '\0J1\x1A.'  # '.' is the first version.
+sha1_module = type(sys)('sha1_module')
+sha1_module.new = sha1
+sha1_module.digest_size = 20
+
+# Just a quick sanity check.
+assert 'c387b401c957209a84d581a23247f9199292a052' == hmac.new(
+    'mykey', 'mymsg', sha1_module).hexdigest()
+m = hmac.new('mykey', None, sha1_module)
+m.update('mymsg')
+assert 'c387b401c957209a84d581a23247f9199292a052' == m.hexdigest()
+
+
+
+HEADER_START = '\0J1\x1A/'  # '.' is the first version.
 
 PASSPHRASE_FD = 62
 """File descriptor openssl can read to get the passphrase."""
@@ -75,29 +89,73 @@ def JoeFileWorker(np_write_fd, encfile):
         if len(header) < 32 or not header.startswith(HEADER_START):
           assert 0, ('error: unrecognized header %s' %
                      header.encode('hex'))
+        expected_hmac = header[12 : 32]
+        os.write(np_write_fd, 'W')
+        passphrasen = os.read(PASSPHRASE_FD, 4096)
+        i = passphrasen.find('\n')
+        assert i == len(passphrasen) - 1
+        hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
+        passphrasen = None
         if fd > 9:  # Some shells (e.g. dash) can't redirect to multi-digit.s
           os.dup2(fd, 3)
           os.close(fd)
           fd = 3
         # Ask the parent to write the passphrase for openssl below.
         os.write(np_write_fd, 'W')
-        assert not os.system(
+        rf = os.popen(
             'openssl enc -aes-256-cbc -salt -d -pass fd:%s <&%d' %
-            (PASSPHRASE_FD, fd))
-      #os.write(1, 'READ FILE TO JOE')
+            (PASSPHRASE_FD, fd), 'r')
+        rfd = rf.fileno()
+        output = []
+        while True:
+          data = os.read(rfd, 8192)
+          if not data:
+            break
+          hmac_obj.update(data)
+          output.append(data)
+        got_hmac = hmac_obj.digest()
+        if  expected_hmac != got_hmac:
+          # Don't write anything until hmac is proven correct.
+          # We may also display an OpenSSL error above.
+          assert 0, 'hmac mismatch: %s' % encfile
+        output = ''.join(output)
+        got = os.write(1, output)
+        while got < len(output):
+          output = buffer(output, got)
+          got = os.write(1, output)
+        #os.write(1, 'READ FILE TO JOE')
     elif stat.S_ISFIFO(st0.st_mode) and not stat.S_ISFIFO(st1.st_mode):
       # TODO(pts): Better write error handling.
       #open('save.dat', 'w').write(time.ctime() + '\n' + sys.stdin.read())
       os.write(np_write_fd, 'W')
-      #os.system('echo foobar >%s' % QuoteShellWord(encfile))
+      passphrasen = os.read(PASSPHRASE_FD, 4096)
+      i = passphrasen.find('\n')
+      assert i == len(passphrasen) - 1
+      hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
+      passphrasen = None
+      os.write(np_write_fd, 'W')
       # Write the header.
       fd = os.open(encfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0644)
       if fd != 1:
         os.dup2(fd, 1)
         os.close(fd)
-      assert 32 == os.write(1, '\0J1\x1A.56789ABCDEF0123456789abcdef')
-      assert not os.system(
-          'openssl enc -aes-256-cbc -salt -pass fd:%s' % PASSPHRASE_FD)
+      assert 32 == os.write(1, '\0J1\x1A/56789AB((((SHA1CHECKSUM))))')
+      wf = os.popen(
+          'openssl enc -aes-256-cbc -salt -pass fd:%s' % PASSPHRASE_FD, 'w')
+      wfd = wf.fileno()
+      while True:
+        data = os.read(0, 8192)
+        if not data:
+          break
+        hmac_obj.update(data)
+        got = os.write(wfd, data)
+        while got < len(data):
+          data = buffer(data, got)
+          got = os.write(wfd, data)
+      assert not wf.close(), 'openssl failed'
+      os.lseek(1, 12, 0)
+      assert 20 == os.write(1, hmac_obj.digest())
+      # TODO(pts): Better error reporting on assertion failure here.
     else:
       assert 0, 'error: invalid pipe invocation'
   except SystemExit:
@@ -107,7 +165,10 @@ def JoeFileWorker(np_write_fd, encfile):
     os.close(1)
     if not os.fork():  # Report in a child process, so joe doesn't wait for it.
       time.sleep(0.3)
-      os.write(2, 'joenc1 ERROR: %s: %s\r' % (type(exc).__name__, exc))
+      if isinstance(exc, AssertionError):
+        os.write(2, 'joenc1 ERROR: %s\r' % exc)
+      else:
+        os.write(2, 'joenc1 EXC: %s: %s\r' % (type(exc).__name__, exc))
       os._exit(3)
 
 def ShowUsage(): 
@@ -233,6 +294,7 @@ if __name__ == '__main__':
 
   joe_prog = (FindOnPath('joe-p37') or
               FindOnPath('joe-p35') or
+              FindOnPath('joe.mc') or
               FindOnPath('joe'))
   if not joe_prog:
     print >>sys.stderr, 'error: joe: command not found'
@@ -282,15 +344,30 @@ if __name__ == '__main__':
               fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
 
   if header:  # Non-empty file.
+    expected_hmac = header[12 : 32]
     assert len(passphrasen) == os.write(pp_write_fd, passphrasen)
     if fd > 9:  # TODO(pts): Restore this after os.system
       os.dup2(fd, 3)
       os.close(fd)
       fd = 3
-    status = os.system(
-        'openssl enc -aes-256-cbc -salt -d -pass fd:%s '
-        '<&%d >/dev/null' %
-        (PASSPHRASE_FD, fd))
+    rf = os.popen(
+        'openssl enc -aes-256-cbc -salt -d -pass fd:%s <&%d' %
+        (PASSPHRASE_FD, fd), 'r')
+    rfd = rf.fileno()
+    hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
+    while True:
+      data = os.read(rfd, 8192)
+      if not data:
+        break
+      hmac_obj.update(data)
+    got_hmac = hmac_obj.digest()
+    if expected_hmac != got_hmac:
+      # We may also display an OpenSSL error above.
+      print >>sys.stderr, 'error: hmac mismatch (bad passphrase?): %s' % (
+          encfile)
+      sys.exit(9)
+    del hmac_obj
+    status = rf.close() or 0
     if status:
       # This doesn't always detect the failure, sometimes it just decrypts the
       # wrong data (we'd need file integrity protection).
