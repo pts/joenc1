@@ -17,20 +17,26 @@ Example new command, with automatic decryption on load and encryption on save.
 
 __author__ = 'pts@fazekas.hu (Peter Szabo)'
 
+import base64
+import cStringIO
 import errno
 import fcntl
-import hmac
 import getpass
+import hmac
 import os
 import os.path
-import stat
 import re
-import sys
+import socket
+import stat
+import struct
 import subprocess
+import sys
 import thread
 import time
 import traceback
 
+
+# SHA-1 (160 bit output), available since Python2.4 (or earlier).
 try:
   import hashlib  # No deprecation warning in Python 2.6.
   sha1 = hashlib.sha1
@@ -56,7 +62,8 @@ PASSPHRASE_FD = 62
 """File descriptor openssl can read to get the passphrase."""
 
 def PassphraseSender(read_fd, write_fd, passphrasen):
-  if not isinstance(passphrase, str):
+  # Exceptions raised here a lost (not reported to joe).
+  if not isinstance(passphrasen, str):
     raise TypeError
   while True:
     os.read(read_fd, 1)
@@ -193,15 +200,256 @@ def FindOnPath(binary):
         return file_name
   return None
 
+PREP = {
+    'salt1': 'foo',
+    'salt2': 'bar',
+    'num_iterations': 1903,
+    'salt1_rsa': 'baz',
+    'salt2_rsa': 'quux',
+    'num_iterations_before_rsa_fix': 951,
+}
+"""Parameters of preprocessing."""
+
 
 def PreprocessPassphrase(passphrase):
-  salt1 = 'foo'
-  salt2 = 'bar'
+  salt1 = PREP['salt1']
+  salt2 = PREP['salt2']
   data = passphrase
-  for i in xrange(1903):
-    # sha: SHA-1 (160 bit output), available in Python2.4.
+  for i in xrange(PREP['num_iterations']):
     data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
   return data.encode('base64').rstrip('\n')
+
+
+def StrXor(s1, s2):
+  # PyCrypto has a faster implementation (but Python 2.6 doesn't), but we don't care much here, because
+  # we don't call StrXor in an inner loop.
+  return ''.join(map(lambda x, y: chr(ord(x) ^ ord(y)), s1, s2))
+
+
+def PreprocessRsaSignature(signature, fixup):
+  assert len(fixup) == 40
+  assert len(signature) >= 40
+  salt1 = PREP['salt1_rsa']
+  salt2 = PREP['salt2_rsa']
+  data = signature[-40:]
+  n1 = PREP['num_iterations_before_rsa_fix']
+  n2 = PREP['num_iterations']
+  # It would work (but may be cryptographically weaker with <= instead of <).
+  assert 0 < n1 < n2
+  for i in xrange(n1):
+    data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  assert len(data) == 40
+  data = StrXor(data, fixup)
+  salt1 = PREP['salt1']
+  salt2 = PREP['salt2']
+  for i in xrange(n1, n2):
+    data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  return data.encode('base64').rstrip('\n')
+
+
+def GetFixup(passphrase, signature):
+  """Compute and return the binary fixup= value for the .akeys file."""
+  assert len(signature) >= 40
+  n1 = PREP['num_iterations_before_rsa_fix']
+  salt1 = PREP['salt1']
+  salt2 = PREP['salt2']
+  data = passphrase
+  for i in xrange(n1):
+    data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  middle = data
+  salt1 = PREP['salt1_rsa']
+  salt2 = PREP['salt2_rsa']
+  data = signature[-40:]
+  for i in xrange(n1):
+    data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  return StrXor(middle, data)
+
+
+SSH2_AGENTC_REQUEST_IDENTITIES = 11
+SSH2_AGENT_IDENTITIES_ANSWER = 12
+SSH2_AGENTC_SIGN_REQUEST = 13
+SSH2_AGENT_SIGN_RESPONSE = 14
+SSH_AGENT_FAILURE = 5
+
+
+def RecvAll(sock, size):
+  if size == 0:
+    return ''
+  assert size >= 0
+  if hasattr(sock, 'recv'):
+    recv = sock.recv
+  else:
+    recv = sock.read
+  data = recv(size)
+  if len(data) >= size:
+    return data
+  assert data, 'unexpected EOF'
+  output = [data]
+  size -= len(data)
+  while size > 0:
+    output.append(recv(size))
+    assert output[-1], 'unexpected EOF'
+    size -= len(output[-1])
+  return ''.join(output)
+
+def RecvU32(sock):
+  return struct.unpack('>L', RecvAll(sock, 4))[0]
+
+def RecvStr(sock):
+  return RecvAll(sock, RecvU32(sock))
+
+def AppendStr(ary, data):
+  assert isinstance(data, str)
+  ary.append(struct.pack('>L', len(data)))
+  ary.append(data)
+
+
+def ReadRsaInfo(encfile):
+  """Return (signature, fixup, comment) or (None, None, None)."""
+  # TODO(pts): Write a function which updates the fixup= field in the .akeys
+  # file, possibly using GetFixup.
+  akeys_filename = encfile + '.akeys'
+  try:
+    f = open(akeys_filename)
+  except IOError:
+    return None, None, None
+  # List of aitem dictionaries, as parsed from the akeys file.
+  aitems = []
+  try:
+    for line in f.xreadlines():
+      line = line.strip()
+      if line.startswith('#') or not line:
+        continue
+      items = line.split()
+      i = 0
+      h = {}
+      while i < len(items):
+        match = re.match(r'([^\s=]+)=(\S+)\Z', items[i])
+        if not match:
+          break
+        h[match.group(1)] = match.group(2)
+        i += 1
+      if not (i == len(items) - 3 and items[i] == 'ssh-rsa' and
+              'random' in h and 'fixup' in h):
+        continue
+      comment = items[i + 2]
+      public_key = base64.b64decode(items[i + 1])
+      assert re.match('[0-9a-fA-F]{80}\Z', h['random'])
+      assert re.match('[0-9a-fA-F]{80}\Z', h['fixup'])
+      # Decode the SSH2 public key.
+      assert public_key.startswith('\0\0\0\7ssh-rsa\0\0')
+      assert len(public_key) >= 15
+      public_exponent_size = struct.unpack('>L', public_key[11 : 15])[0]
+      assert len(public_key) >= 15 + public_exponent_size
+      public_exponent = int(
+          public_key[15 : 15 + public_exponent_size].encode('hex'), 16)
+      i = 15 + public_exponent_size
+      assert len(public_key) >= 4 + i
+      modulus_size = struct.unpack('>L', public_key[i : i + 4])[0]
+      assert len(public_key) == 4 + i + modulus_size
+      modulus = int(
+          public_key[4 + i : 4 + i + modulus_size].encode('hex'), 16)
+      aitem = {
+          'comment': comment,
+          'random': h['random'].decode('hex'),
+          'fixup': h['fixup'].decode('hex'),
+          'public_exponent': public_exponent,
+          'modulus': modulus,
+      }
+      aitems.append(aitem)
+  finally:
+    f.close()
+  if not aitems:
+    print >>sys.stderr, 'warning: no RSA keys recognized in akeys file: %s' % (
+        akeys_filename)
+    return None, None, None
+
+  # Connect to ssh-agent.
+  if not os.getenv('SSH_AUTH_SOCK', ''):
+    print >>sys.stderr, 'warning: no ssh-agent to connect to'
+    return None, None, None
+  sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+  try:
+    sock.connect(os.getenv('SSH_AUTH_SOCK'))
+  except socket.error, e:
+    print >>sys.stderr, 'warning: cannot connect to ssh-agent: %s' % e
+    return None, None, None
+
+  # Get list of public keys, and find our key.
+  sock.sendall('\0\0\0\1\v') # SSH2_AGENTC_REQUEST_IDENTITIES
+  response = RecvStr(sock)
+  resf = cStringIO.StringIO(response)
+  assert RecvAll(resf, 1) == chr(SSH2_AGENT_IDENTITIES_ANSWER)
+  num_keys = RecvU32(resf)
+  assert num_keys < 2000  # A quick sanity check.
+  assert num_keys, 'no keys have_been added to ssh-agent'
+  comments = set(aitem['comment'] for aitem in aitems)
+  found_comment = None
+  for i in xrange(num_keys):
+    key = RecvStr(resf)
+    comment = RecvStr(resf)
+    if (not key.startswith('\x00\x00\x00\x07ssh-rsa\x00\x00') or
+        comment not in comments):
+      continue
+    keyf = cStringIO.StringIO(key[11:])
+    public_exponent = int(RecvStr(keyf).encode('hex'), 16)
+    modulus_str = RecvStr(keyf)
+    modulus = int(modulus_str.encode('hex'), 16)
+    assert '' == keyf.read(1), 'EOF expected in keyf'
+    #print (public_exponent, modulus, comment)
+    found_fixup = found_random = None
+    for aitem in aitems:
+      if (aitem['public_exponent'] == public_exponent and
+          aitem['modulus'] == modulus and aitem['comment'] == comment):
+        found_fixup = aitem['fixup']
+        found_random = aitem['random']
+        break
+    if found_fixup is None:
+      continue
+    found_comment = comment  # Find the last match.
+  assert '' == resf.read(1), 'EOF expected in resf'
+  if found_comment is None:
+    print >>sys.stderr, (
+        'warning: keys in ssh-agent not matching any key in: %s' %
+        akeys_filename)
+    return None, None, None
+
+  # Ask ssh-agent to sign with our key.
+  request_output = [chr(SSH2_AGENTC_SIGN_REQUEST)]
+  AppendStr(request_output, key)
+  AppendStr(request_output, found_random)  # Message to sign.
+  request_output.append(struct.pack('>L', 0))  # flags == 0
+  full_request_output = []
+  AppendStr(full_request_output, ''.join(request_output))
+  full_request_str = ''.join(full_request_output)
+  sock.sendall(full_request_str)
+  response = RecvStr(sock)
+  resf = cStringIO.StringIO(response)
+  assert RecvAll(resf, 1) == chr(SSH2_AGENT_SIGN_RESPONSE)
+  signature = RecvStr(resf)
+  assert '' == resf.read(1), 'EOF expected in resf'
+  assert signature.startswith('\0\0\0\7ssh-rsa\0\0')
+  sigf = cStringIO.StringIO(signature[11:])
+  signature = RecvStr(sigf)
+  assert len(signature) >= 40  # Much longer, e.g. 256, 512 or 1024 bytes.
+  signed_value = int(signature.encode('hex'), 16)
+  assert '' == sigf.read(1), 'EOF expected in sigf'
+  #print repr(signed_value)  # This is the same for each run with the same
+  # input.
+
+  # Verify the signature.
+  decoded_value = pow(signed_value, public_exponent, modulus)
+  decoded_hex = '%x' % decoded_value
+  if len(decoded_hex) & 1:
+    decoded_hex = '0' + decoded_hex
+  decoded_str = decoded_hex.decode('hex')
+  assert len(decoded_str) == len(modulus_str) - 2  # e.g. (255, 257)
+  assert re.match(r'\x01\xFF+\Z', decoded_str[:-36]), 'bad padding found'
+  expected_sha1_hex = decoded_hex[-40:]
+  msg_sha1_hex = sha1(found_random).hexdigest()
+  assert expected_sha1_hex == msg_sha1_hex, 'bad signature (SHA1 mismatch)'
+
+  return signature[:-40], found_fixup, found_comment
 
 
 if __name__ == '__main__':
@@ -209,14 +457,19 @@ if __name__ == '__main__':
       len(sys.argv) == 2):
     sys.exit(JoeFileWorker(int(os.getenv('JOENC1_FILE_WORKER')), sys.argv[1]))
 
-  argv = sys.argv
+  argv = list(sys.argv)
 
   if len(argv) <= 1 or argv[1] == '--help':
     ShowUsage()
     sys.exit(0)
 
+  do_getfixup = False
   i = 1
   while i < len(argv):
+    if argv[i] == '-getfixup':
+      del argv[i]
+      do_getfixup = True
+      continue
     if not argv[i].startswith('-') or argv[i] == '-':
       break
     i += 1
@@ -300,37 +553,55 @@ if __name__ == '__main__':
     print >>sys.stderr, 'error: joe: command not found'
     sys.exit(7)
 
-  try:
+  if header:
+    signature, fixup, comment = ReadRsaInfo(encfile)
+  else:
+    signature = fixup = comment = None
+  if signature is None or do_getfixup:
     if not header:
-      prompt = 'joenc1 new passphrase for empty %r: ' % encfile
+      prompt = 'joenc1 new passphrase of empty %r: ' % encfile
+    elif do_getfixup:
+      if signature is None:
+        print >>sys.stderr, 'error: getfixup without matching signature'
+        sys.exit(10)
+      prompt = 'joenc1 passphrase for getfixup of %r: ' % encfile
     else:
-      prompt = 'joenc1 passphrase for %r: ' % encfile
-    passphrase = getpass.getpass(prompt=prompt)
-  except EOFError:
-    print >>sys.stderr, 'end-of-file, exiting'
-    sys.exit(4)
-  except KeyboardInterrupt:
-    print >>sys.stderr, 'interrupted, exiting'
-    sys.exit(4)
-  passphrase = passphrase.strip()
-  passphrasen = PreprocessPassphrase(passphrase)
-  assert '\n' not in passphrasen
-  passphrasen += '\n'
-
-  if not header:  # Empty file.
+      prompt = 'joenc1 passphrase of %r: ' % encfile
     try:
-      passphrase_again = getpass.getpass(prompt='Passphrase again: ')
+      passphrase = getpass.getpass(prompt=prompt)
     except EOFError:
-      print >>sys.stderr, 'end-of-file, exiting'
+      print >>sys.stderr, 'info: end-of-file, exiting'
       sys.exit(4)
     except KeyboardInterrupt:
-      print >>sys.stderr, 'interrupted, exiting'
+      print >>sys.stderr, 'info: interrupted, exiting'
       sys.exit(4)
-    passphrase_again = passphrase_again.strip()
-    if passphrase_again != passphrase:
-      print >>sys.stderr, 'error: new passphrase mismatch'
-      sys.exit(6)
-    passphrase_again = None
+    passphrase = passphrase.strip()
+    if do_getfixup:
+      fixup = GetFixup(passphrase, signature)
+      # TODO(pts): Emit the whole key line, or update encfile + '.akeys'.
+      print 'fixup=%s' % fixup.encode('hex')
+      sys.exit(0)
+    passphrasen = PreprocessPassphrase(passphrase)
+    if not header:  # Empty file.
+      try:
+        passphrase_again = getpass.getpass(prompt='Passphrase again: ')
+      except EOFError:
+        print >>sys.stderr, 'end-of-file, exiting'
+        sys.exit(4)
+      except KeyboardInterrupt:
+        print >>sys.stderr, 'interrupted, exiting'
+        sys.exit(4)
+      passphrase_again = passphrase_again.strip()
+      if passphrase_again != passphrase:
+        print >>sys.stderr, 'error: new passphrase mismatch'
+        sys.exit(6)
+      del passphrase_again
+    del passphrase
+  else:
+    print >>sys.stderr, 'info: using RSA key %s' % comment
+    passphrasen = PreprocessRsaSignature(signature, fixup)
+  assert '\n' not in passphrasen
+  passphrasen += '\n'
 
   pp_read_fd, pp_write_fd = os.pipe()
   if pp_read_fd != PASSPHRASE_FD:
