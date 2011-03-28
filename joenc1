@@ -13,6 +13,21 @@ Example new command, with automatic decryption on load and encryption on save.
   $ joenc1 [-beep] encrypted-file1 file2 file3
   joenc1 passphrase for 'encrypted-file1':
 
+Example setup for SSH signing:
+
+  # Create encrypted-file1 just as above (pick a passphrase, can be random).
+  # Start ssh-agent and make sure you have a working $SSH_AUTH_SOCK .
+  # Don't put whitespace in the comment below:
+  $ ssh-keygen -t rsa -b 4096 -C 'my-joenc1-key' -f keyfile
+  # You may or may not have an SSH key passphrase here.
+  $ ssh-add keyfile
+  $ cp keyfile.pub encrypted-file1.akey
+  $ joenc1 -getfixup encrypted-file1
+  # Type encrypted-file1 passphrase.
+  # Copy-paste the printed output back to encrypted-file1.
+  $ joenc1 encrypted-file1
+  # This should not ask for the encrypted-file1 passphrase (but it should
+  # for the SSH key passphrase).
 """
 
 __author__ = 'pts@fazekas.hu (Peter Szabo)'
@@ -304,15 +319,15 @@ def AppendStr(ary, data):
   ary.append(data)
 
 
-def ReadRsaInfo(encfile):
-  """Return (signature, fixup, comment) or (None, None, None)."""
+def ReadRsaInfo(encfile, is_plain_ok):
+  """Return (signature, fixup, comment, random, public_key_base64) or (None, None, None, None, None)."""
   # TODO(pts): Write a function which updates the fixup= field in the .akeys
   # file, possibly using GetFixup.
   akeys_filename = encfile + '.akeys'
   try:
     f = open(akeys_filename)
   except IOError:
-    return None, None, None
+    return None, None, None, None, None
   # List of aitem dictionaries, as parsed from the akeys file.
   aitems = []
   try:
@@ -320,6 +335,8 @@ def ReadRsaInfo(encfile):
       line = line.strip()
       if line.startswith('#') or not line:
         continue
+      # TODO(pts): Support spaces in the comment section (ssh-keygen
+      # supports it).
       items = line.split()
       i = 0
       h = {}
@@ -329,13 +346,22 @@ def ReadRsaInfo(encfile):
           break
         h[match.group(1)] = match.group(2)
         i += 1
-      if not (i == len(items) - 3 and items[i] == 'ssh-rsa' and
-              'random' in h and 'fixup' in h):
+      if i != len(items) - 3 or items[i] != 'ssh-rsa':
+        continue
+      if not is_plain_ok and not (
+          h.get('random', '?') != '?' and h.get('fixup', '?') != '?'):
         continue
       comment = items[i + 2]
-      public_key = base64.b64decode(items[i + 1])
+      public_key_base64 = items[i + 1]
+      public_key = base64.b64decode(public_key_base64)
+      if h.get('random', '?') == '?':
+        h['random'] = os.urandom(40).encode('hex')
+      if h.get('fixup', '?') == '?':
+        fixup = None
+      else:
+        assert re.match('[0-9a-fA-F]{80}\Z', h['fixup'])
+        fixup = h['fixup'].decode('hex')
       assert re.match('[0-9a-fA-F]{80}\Z', h['random'])
-      assert re.match('[0-9a-fA-F]{80}\Z', h['fixup'])
       # Decode the SSH2 public key.
       assert public_key.startswith('\0\0\0\7ssh-rsa\0\0')
       assert len(public_key) >= 15
@@ -352,9 +378,10 @@ def ReadRsaInfo(encfile):
       aitem = {
           'comment': comment,
           'random': h['random'].decode('hex'),
-          'fixup': h['fixup'].decode('hex'),
+          'fixup': fixup,
           'public_exponent': public_exponent,
           'modulus': modulus,
+          'public_key_base64': public_key_base64,
       }
       aitems.append(aitem)
   finally:
@@ -362,18 +389,18 @@ def ReadRsaInfo(encfile):
   if not aitems:
     print >>sys.stderr, 'warning: no RSA keys recognized in akeys file: %s' % (
         akeys_filename)
-    return None, None, None
+    return None, None, None, None, None
 
   # Connect to ssh-agent.
   if not os.getenv('SSH_AUTH_SOCK', ''):
     print >>sys.stderr, 'warning: no ssh-agent to connect to'
-    return None, None, None
+    return None, None, None, None, None
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
   try:
     sock.connect(os.getenv('SSH_AUTH_SOCK'))
   except socket.error, e:
     print >>sys.stderr, 'warning: cannot connect to ssh-agent: %s' % e
-    return None, None, None
+    return None, None, None, None, None
 
   # Get list of public keys, and find our key.
   sock.sendall('\0\0\0\1\v') # SSH2_AGENTC_REQUEST_IDENTITIES
@@ -397,14 +424,15 @@ def ReadRsaInfo(encfile):
     modulus = int(modulus_str.encode('hex'), 16)
     assert '' == keyf.read(1), 'EOF expected in keyf'
     #print (public_exponent, modulus, comment)
-    found_fixup = found_random = None
+    found_fixup = found_random = found_public_key_base64 = None
     for aitem in aitems:
       if (aitem['public_exponent'] == public_exponent and
           aitem['modulus'] == modulus and aitem['comment'] == comment):
         found_fixup = aitem['fixup']
         found_random = aitem['random']
+        found_public_key_base64 = aitem['public_key_base64']
         break
-    if found_fixup is None:
+    if found_random is None:
       continue
     found_comment = comment  # Find the last match.
   assert '' == resf.read(1), 'EOF expected in resf'
@@ -412,7 +440,7 @@ def ReadRsaInfo(encfile):
     print >>sys.stderr, (
         'warning: keys in ssh-agent not matching any key in: %s' %
         akeys_filename)
-    return None, None, None
+    return None, None, None, None, None
 
   # Ask ssh-agent to sign with our key.
   request_output = [chr(SSH2_AGENTC_SIGN_REQUEST)]
@@ -443,13 +471,15 @@ def ReadRsaInfo(encfile):
   if len(decoded_hex) & 1:
     decoded_hex = '0' + decoded_hex
   decoded_str = decoded_hex.decode('hex')
-  assert len(decoded_str) == len(modulus_str) - 2  # e.g. (255, 257)
+  assert len(decoded_str) == len(modulus_str) - 2, (  # e.g. (255, 257)
+      len(decoded_str), len(modulus_str))
   assert re.match(r'\x01\xFF+\Z', decoded_str[:-36]), 'bad padding found'
   expected_sha1_hex = decoded_hex[-40:]
   msg_sha1_hex = sha1(found_random).hexdigest()
   assert expected_sha1_hex == msg_sha1_hex, 'bad signature (SHA1 mismatch)'
 
-  return signature[:-40], found_fixup, found_comment
+  return (signature[:-40], found_fixup, found_comment,
+          found_random, found_public_key_base64)
 
 
 if __name__ == '__main__':
@@ -554,9 +584,10 @@ if __name__ == '__main__':
     sys.exit(7)
 
   if header:
-    signature, fixup, comment = ReadRsaInfo(encfile)
+    signature, fixup, comment, random, public_key_base64 = ReadRsaInfo(encfile, do_getfixup)
   else:
-    signature = fixup = comment = None
+    signature = fixup = comment = random = public_key_base64 = None
+
   if signature is None or do_getfixup:
     if not header:
       prompt = 'joenc1 new passphrase of empty %r: ' % encfile
@@ -579,8 +610,9 @@ if __name__ == '__main__':
     if do_getfixup:
       fixup = GetFixup(passphrase, signature)
       # TODO(pts): Emit the whole key line, or update encfile + '.akeys'.
-      print 'fixup=%s' % fixup.encode('hex')
-      sys.exit(0)
+      akeys_line = 'fixup=%s random=%s ssh-rsa %s %s\n' % (
+          fixup.encode('hex'), random.encode('hex'),
+          public_key_base64, comment)
     passphrasen = PreprocessPassphrase(passphrase)
     if not header:  # Empty file.
       try:
@@ -603,18 +635,20 @@ if __name__ == '__main__':
   assert '\n' not in passphrasen
   passphrasen += '\n'
 
-  pp_read_fd, pp_write_fd = os.pipe()
-  if pp_read_fd != PASSPHRASE_FD:
-    if pp_write_fd == PASSPHRASE_FD:
-      pp_write_fd = os.dup(pp_write_fd)
-    os.dup2(pp_read_fd, PASSPHRASE_FD)
-    os.close(pp_read_fd)
-    pp_read_fd = PASSPHRASE_FD
-  # pp_read_fd has ~FD_CLOEXEC by default, we don't have to change that.
-  fcntl.fcntl(pp_write_fd, fcntl.F_SETFD,
-              fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
-
   if header:  # Non-empty file.
+    # Create passphrase pipe for openssl below.
+    pp_read_fd, pp_write_fd = os.pipe()
+    if pp_read_fd != PASSPHRASE_FD:
+      if pp_write_fd == PASSPHRASE_FD:
+        pp_write_fd = os.dup(pp_write_fd)
+      os.dup2(pp_read_fd, PASSPHRASE_FD)
+      os.close(pp_read_fd)
+      pp_read_fd = PASSPHRASE_FD
+    # pp_read_fd has ~FD_CLOEXEC by default, we don't have to change that.
+    fcntl.fcntl(pp_write_fd, fcntl.F_SETFD,
+                fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+
+    # Start openssl to decrypt the file in order to compute the hmac.
     expected_hmac = header[12 : 32]
     assert len(passphrasen) == os.write(pp_write_fd, passphrasen)
     if fd > 9:  # TODO(pts): Restore this after os.system
@@ -645,6 +679,11 @@ if __name__ == '__main__':
       print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
       sys.exit((status >> 8) or 5)
   os.close(fd)
+
+  if do_getfixup:
+    # TODO(pts): Insert it to the .akeys file automatically.
+    sys.stdout.write(akeys_line)
+    sys.exit(0)
 
   # The need-password pipe.
   np_read_fd, np_write_fd = os.pipe()
