@@ -471,6 +471,7 @@ def ReadRsaInfo(encfile, is_plain_ok):
   if len(decoded_hex) & 1:
     decoded_hex = '0' + decoded_hex
   decoded_str = decoded_hex.decode('hex')
+  # (1024, 1025) is not good, it means that the wrong key is used (??)
   assert len(decoded_str) == len(modulus_str) - 2, (  # e.g. (255, 257)
       len(decoded_str), len(modulus_str))
   assert re.match(r'\x01\xFF+\Z', decoded_str[:-36]), 'bad padding found'
