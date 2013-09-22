@@ -431,6 +431,7 @@ def ReadRsaInfo(encfile, is_plain_ok):
           aitem['modulus'] == modulus):
         #assert not is_found, 'Found multiple matching keys in ssh-agent.'
         is_found = True
+        found_key = key
         found_fixup = aitem['fixup']
         found_random = aitem['random']
         found_public_key_base64 = aitem['public_key_base64']
@@ -448,7 +449,7 @@ def ReadRsaInfo(encfile, is_plain_ok):
   # properly with it. Sigh. But maybe another key has been already added
   # properly.
   request_output = [chr(SSH2_AGENTC_SIGN_REQUEST)]
-  AppendStr(request_output, key)
+  AppendStr(request_output, found_key)
   AppendStr(request_output, found_random)  # Message to sign.
   request_output.append(struct.pack('>L', 0))  # flags == 0
   full_request_output = []
@@ -461,7 +462,7 @@ def ReadRsaInfo(encfile, is_plain_ok):
   assert RecvAll(resf, 1) == chr(SSH2_AGENT_SIGN_RESPONSE)
   signature = RecvStr(resf)
   assert '' == resf.read(1), 'EOF expected in resf'
-  assert signature.startswith('\0\0\0\7ssh-rsa\0\0')
+  assert signature.startswith('\0\0\0\7ssh-rsa\0\0'), repr(signature[:16])
   sigf = cStringIO.StringIO(signature[11:])
   signature = RecvStr(sigf)
   assert len(signature) >= 40  # Much longer, e.g. 256, 512 or 1024 bytes.
