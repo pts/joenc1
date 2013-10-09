@@ -1,34 +1,73 @@
-#! /usr/bin/env python
+#! /bin/sh
 # by pts@fazekas.hu at Sun Jun  6 18:06:47 CEST 2010
 
-"""Start joe(1) opening and encrypting a single file. !! fix for non-joe
+""":" #joenc1: Convenient single-file encryption with passphrases and SSH keys.
 
-Example old command:
+type python2.7 >/dev/null 2>&1 && exec python2.7 -- "$0" ${1+"$@"}
+type python2.6 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+type python2.5 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+type python2.4 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+exec python -- ${1+"$@"}
+exit 1
 
-  joe [-beep] file1 file2 file3
+Requirements: Python (2.4, 2.5, 2.6 or 2.7; doesn't work with 3.x) and the
+openssl(1) command-line tool. For SSH keys, a running ssh-agent is also
+needed. For JOE text editor intergration, the joe binary is also needed.
 
-Example new command, with automatic decryption on load and encryption on save.
+Typical first steps using a passphrase:
 
-  $ touch encrypted-file1
-  $ joenc1 [-beep] encrypted-file1 file2 file3
-  joenc1 new passphrase for 'encrypted-file1':
+  $ joenc1 --create encrypted-file1  # Prompts for the new passphrase.
+  $ echo hello | joenc1 --encrypt encrypted-file1
+  $ joenc1 --decrypt encrypted-file1
 
-Example setup for SSH signing:
+Typical first steps using SSH keys:
 
-  # Create encrypted-file1 just as above (pick a passphrase, can be random).
-  # Start ssh-agent and make sure you have a working $SSH_AUTH_SOCK .
-  # Create your SSH keypair. Make sure it's RSA (-t rsa).
-  $ ssh-keygen -t rsa -b 4096 -C 'my-joenc1-key' -f keyfile
-  # You may or may not have an SSH key passphrase here.
-  $ ssh-add keyfile
-  $ cp keyfile.pub encrypted-file1.akeys
-  $ joenc1 -getfixup encrypted-file1
-  # Type encrypted-file1 passphrase.
-  # Copy-paste the printed output back to encrypted-file1.
-  $ joenc1 encrypted-file1
-  # This should not ask for the encrypted-file1 passphrase (but it should
-  # for the SSH key passphrase if not added to the agent).
+  $ ssh-add -L  # Just to make sure ssh-agent is running fine.
+  $ ssh-keygen -t rsa -b 4096 -C my-joenc1-key -f ssh-keyfile
+  # If you don't want to have a key passphrase, just press Enter above.
+  $ joenc1 --create-with-key ssh-keyfile encrypted-file2
+  # joenc1 calls `ssh-add ssh-keyfile' automatically.
+  $ echo hello | joenc1 --encrypt encrypted-file2
+  $ joenc1 --decrypt encrypted-file2
+
+Typical command-line usage:
+
+  $ joenc1 --create encrypted-file1
+  $ joenc1 --create-with-key ssh-keyfile encrypted-file1
+  $ joenc1 --decrypt encrypted-file1  # Writes plaintext to stdout on success.
+  $ joenc1 --encrypt encrypted-file1  # Reads plaintext from stdin.
+
+Typical startup of the JOE text editor for editing encrypted text files:
+
+  # Instead of: $ joe [-flag...] file1 file2 file3
+  $ joenc1 [-flag...] encrypted-file1 file2 file3
+
+Setup notes:
+
+* Use the --create flag to create an empty encrypted file with a passphrase.
+* Calling --create again is a no-op (it won't clobber the file).
+* You can add SSH keys later using --create-with-key. An SSH key available in
+  the ssh-agent can be used instead of a passphrase.
+* If you create the encrypted file with --create-with-key, then no passphrase
+  would ever be asked, and the only way to decrypt the file is using SSH keys
+  (added to the ssh-agent).
+* You can add subsequent SSH keys later using --create-with-key. This won't
+  clobber the file, and it won't remove existing SSH keys.
+* Any SSH key added with --create-with-key will work for encryption and
+  decryption.
+* The added SSH keys are stored in encrypted-file1.akeys.
+* Only SSH2 RSA keys are supported.
 """
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 
 __author__ = 'pts@fazekas.hu (Peter Szabo)'
 
@@ -75,9 +114,10 @@ assert 'c387b401c957209a84d581a23247f9199292a052' == m.hexdigest()
 
 
 HEADER_START_V1 = '\0J1\x1A.'  # Old file format.
-HEADER_START = '\0J1\x1A/'
+HEADER_START_NOSSHONLY = '\0J1\x1A/'
+HEADER_START_SSHONLY = '\0J1\x1A-'
 # The byte '/' denotes the file version, and '56789AB' are unused.
-HEADER_IN_PROGRESS = '\0J1\x1A/56789AB((((SHA1CHECKSUM))))'
+HEADER_IN_PROGRESS = '\0J1\x1A,56789AB((((SHA1CHECKSUM))))'
 
 
 def PassphraseSender(np_read_fd, pp_write_fd, passphrasen):
@@ -88,7 +128,7 @@ def PassphraseSender(np_read_fd, pp_write_fd, passphrasen):
   1. Client sends 'W' to np_write_fd.
   2. PassphraseSender receives the 'W' in np_read_fd.
   3. PassphraseSender sends the passphrase + '\n' to pp_write_fd.
-  4. Client receives the passphrase + '\n' on passphrase_fd. 
+  4. Client receives the passphrase + '\n' on passphrase_fd.
   """
   # Exceptions raised here a lost (not reported to joe).
   if not isinstance(passphrasen, str):
@@ -130,7 +170,8 @@ def WriteAll(fd, output):
   #os.write(1, 'READ FILE TO JOE')
 
 
-def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd):
+def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd,
+               is_ssh_only):
   """Write encrypted version of source to encfile.
 
   Returns:
@@ -163,9 +204,17 @@ def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd):
     finally:
       p.stdin.close()
       exit_code = p.wait()
-    assert not exit_code, 'openssl encrypt failed with exit_code=%r' % exit_code
-    os.lseek(fd, 12, 0)
-    assert 20 == os.write(fd, hmac_obj.digest())
+    assert not exit_code, (
+        'openssl encrypt failed with exit_code=%r' % exit_code)
+    if is_ssh_only:
+      header = HEADER_START_SSHONLY
+    else:
+      header = HEADER_START_NOSSHONLY
+    header += HEADER_IN_PROGRESS[len(header) : 12]
+    header += hmac_obj.digest()
+    assert len(header) == 32
+    os.lseek(fd, 0, 0)
+    assert 32 == os.write(fd, header)
     return size
   finally:
     os.close(fd)
@@ -186,7 +235,7 @@ class ReadCryptHmacError(ReadCryptError):
 def FdPassphraseRequester(np_write_fd):
   def FdRequest():
     os.write(np_write_fd, 'W')
-  
+
   return FdRequest
 
 
@@ -196,7 +245,14 @@ def InstantPassphraseRequester(pp_write_fd, passphrasen):
     got = os.write(pp_write_fd, passphrasen)
     assert got == len(passphrasen)
 
-  return InstantRequest  
+  return InstantRequest
+
+
+def IsHeaderOk(header):
+  """Returns true iff the file header is recognized as written by joenc1."""
+  return len(header) >= 32 and (
+      header.startswith(HEADER_START_NOSSHONLY) or
+      header.startswith(HEADER_START_SSHONLY))
 
 
 def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
@@ -206,7 +262,7 @@ def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
     header = os.read(fd, 32)
     if not header:
       return ''
-    if len(header) != 32 or not header.startswith(HEADER_START):
+    if not IsHeaderOk(header):
       assert 0, ('error: unrecognized header %s' %
                  header.encode('hex'))
     expected_hmac = header[12 : 32]
@@ -246,7 +302,7 @@ def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
     os.close(fd)
 
 
-def JoeFileWorker(np_write_fd, passphrase_fd, encfile):
+def JoeFileWorker(np_write_fd, passphrase_fd, encfile, is_ssh_only):
   """Called when this program was invoked by joe through `!file'."""
   tty_fd = os.open('/dev/tty', os.O_WRONLY)
   if tty_fd != 2:
@@ -257,11 +313,13 @@ def JoeFileWorker(np_write_fd, passphrase_fd, encfile):
     st0 = os.fstat(0)
     st1 = os.fstat(1)
     if stat.S_ISFIFO(st1.st_mode) and not stat.S_ISFIFO(st0.st_mode):
-      WriteAll(1, ReadCrypt(encfile, passphrase_requester, passphrase_fd, True))
+      WriteAll(1, ReadCrypt(encfile, passphrase_requester, passphrase_fd,
+               True))
     elif stat.S_ISFIFO(st0.st_mode) and not stat.S_ISFIFO(st1.st_mode):
       # TODO(pts): Better write error handling.
       #open('save.dat', 'w').write(time.ctime() + '\n' + sys.stdin.read())
-      WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd)
+      WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd,
+                 is_ssh_only)
       # TODO(pts): Better error reporting on assertion failure here.
     else:
       assert 0, 'error: invalid pipe invocation'
@@ -280,10 +338,10 @@ def JoeFileWorker(np_write_fd, passphrase_fd, encfile):
       os._exit(3)
 
 
-def ShowUsage():
-  # !! show more
-  print >>sys.stderr, (
-      'Usage: %s [<joe-flag> ...] <encfile> [<file> ...]' % sys.argv[0])
+def ShowUsage(argv):
+  doc = re.sub(r'\A(?::" # ?)?', '', __doc__.strip())
+  doc = re.sub(r'(?s)\ntype python.*?\n\n', '', doc, 1)
+  print >>sys.stderr, ('%s\n\n%s' % (argv[0], doc))  # Module docstring.
 
 
 def QuoteShellWord(word):
@@ -344,8 +402,8 @@ def PreprocessMiddle(middle):
 
 
 def StrXor(s1, s2):
-  # PyCrypto has a faster implementation (but Python 2.6 doesn't), but we don't care much here, because
-  # we don't call StrXor in an inner loop.
+  # PyCrypto has a faster implementation (but Python 2.6 doesn't), but we
+  # don't care much here, because we don't call StrXor in an inner loop.
   return ''.join(map(lambda x, y: chr(ord(x) ^ ord(y)), s1, s2))
 
 
@@ -475,7 +533,7 @@ def YieldSshAgentRsaKeys(sock=None):
   if sock is None:
     sock = ConnectToSshAgent()
   if sock is not None:  # Silently ignore sock is None.
-    sock.sendall('\0\0\0\1\v') # SSH2_AGENTC_REQUEST_IDENTITIES
+    sock.sendall('\0\0\0\1\v')  # SSH2_AGENTC_REQUEST_IDENTITIES
     response = RecvStr(sock)
     resf = cStringIO.StringIO(response)
     assert RecvAll(resf, 1) == chr(SSH2_AGENT_IDENTITIES_ANSWER)
@@ -643,11 +701,15 @@ def GetAndVerifySignature(sock, msg_to_sign, public_exponent, modulus):
 
 
 def ReadRsaInfo(encfile, is_plain_ok):
-  """Return (signature, fixup, random, public_key_base64) or (None, None, None, None).
+  """Return (signature, fixup, random, public_key_base64).
+
+  Or return (None, None, None, None).
 
   The returned signature is verified (i.e. that the SSH agent knows the
   private key, or None.
   """
+  # TODO(pts): If the key is not found in the ssh-agent, try to find it in
+  # ~/.ssh/id_* (etc.), and add it to the agent (or to a tmp agent).
   # TODO(pts): Write a function which updates the fixup= field in the .akeys
   # file, possibly using GetFixup.
   akeys_filename = encfile + '.akeys'
@@ -770,7 +832,7 @@ def CheckTerminals():
 
 
 def RunJoe(argv, encfile_i, encfile, pp_write_fd, passphrase_fd, passphrasen,
-           joe_prog):
+           joe_prog, is_ssh_only):
   """Runs joe, does not return (calls sys.exit)."""
   # TODO(pts): Check against EUID.
   if os.access(encfile, os.W_OK):
@@ -783,13 +845,15 @@ def RunJoe(argv, encfile_i, encfile, pp_write_fd, passphrase_fd, passphrasen,
   joe_cmd[0] = joe_prog
   joe_cmd[encfile_i] = '!%s %s' % (
       QuoteShellWord(myprog), QuoteShellWord(encfile))
-  joe_cmd[encfile_i + 1 : encfile_i + 1] = [rdonly_flag]
+  # TODO(pts): Don't make other files in the command-line read-only.
+  joe_cmd[encfile_i : encfile_i] = [rdonly_flag]
 
   # The need-password pipe.
   np_read_fd, np_write_fd = os.pipe()
   fcntl.fcntl(np_read_fd, fcntl.F_SETFD,
               fcntl.fcntl(np_read_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
-  os.environ['JOENC1_FILE_WORKER'] = '%d:%d' % (np_write_fd, passphrase_fd)
+  os.environ['JOENC1_FILE_WORKER'] = '%d:%d:%d' % (
+      np_write_fd, passphrase_fd, int(bool(is_ssh_only)))
 
   p = subprocess.Popen(joe_cmd)
   # TODO(pts): Solve this without threads.
@@ -810,8 +874,9 @@ def VerifyEncrypted(encfile, passphrasen):
     try:
       ReadCrypt(encfile, passphrase_requester, passphrase_fd, False)
     except ReadCryptHmacError:  # TODO(pts): Remove code duplication.
-      # This doesn't always detect the failure, sometimes it just decrypts the
-      # wrong data, that's why we have integrity protection with the hmac above.
+      # This doesn't always detect the failure, sometimes it just decrypts
+      # the wrong data, that's why we have integrity protection with the
+      # hmac above.
       print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
       sys.exit(5)
     except ReadCryptOpensslError:  # TODO(pts): Remove code duplication.
@@ -858,21 +923,31 @@ def ReplaceFile(filename, data):
   os.rename(filename_tmp, filename)
 
 
+def CheckNotSshOnly(is_ssh_only, encfile):
+  """Exits with an error message on SSH-only files."""
+  if is_ssh_only:
+    print >>sys.stderr, (
+        'error: SSH key not available, file has no passphrase: %s' % encfile)
+    print >>sys.stderr, 'info: does the right key show up in?: ssh-add -L'
+    sys.exit(15)
+
+
 def main(argv):
   if (os.getenv('JOENC1_FILE_WORKER', None) is not None and
       len(sys.argv) == 2):
-    np_write_fd, passphrase_fd = map(
-        int, os.getenv('JOENC1_FILE_WORKER').split(':', 1))
-    sys.exit(JoeFileWorker(np_write_fd, passphrase_fd, sys.argv[1]))
+    np_write_fd, passphrase_fd, is_ssh_only = map(
+        int, os.getenv('JOENC1_FILE_WORKER').split(':', 2))
+    is_ssh_only = bool(is_ssh_only)
+    sys.exit(JoeFileWorker(
+        np_write_fd, passphrase_fd, sys.argv[1], is_ssh_only))
 
   argv = list(argv)
 
   if len(argv) <= 1 or argv[1] == '--help':
-    ShowUsage()
+    ShowUsage(argv)
     sys.exit(0)
 
   do_run_joe = None
-  do_getfixup = False
   do_create = False  # Do create if doesn't exist, don't start joe.
   do_encrypt = False
   do_decrypt = False
@@ -881,15 +956,14 @@ def main(argv):
   i = 1
   while i < len(argv):
     arg = argv[i]
-    if arg in ('-getfixup', '--getfixup'):
-      do_getfixup = True
-    elif arg in ('-create', '--create'):
+    if arg in ('-create', '--create'):
       do_create = True
     elif arg in ('-encrypt', '--encrypt'):
       do_encrypt = True
     elif arg in ('-decrypt', '--decrypt'):
       do_decrypt = True
-    elif arg in ('-create-with-key', '--create-with-key') and i + 1 < len(argv):
+    elif arg in ('-create-with-key', '--create-with-key') and (
+        i + 1 < len(argv)):
       do_create_with_key = True
       i += 1
       key_to_add = argv[i]
@@ -901,14 +975,14 @@ def main(argv):
     i += 1
   if i >= len(argv):
     print >>sys.stderr, 'error: encfile not specified'
-    ShowUsage()
+    ShowUsage(argv)
     sys.exit(1)
-  dosum = do_create + do_getfixup + do_encrypt + do_decrypt + do_create_with_key
+  dosum = do_create + do_encrypt + do_decrypt + do_create_with_key
   if do_run_joe is None:
     do_run_joe = not dosum
   if do_run_joe + dosum != 1:
     print >>sys.stder, 'error: invalid combination of action flags'
-    ShowUsage()
+    ShowUsage(argv)
     sys.exit(1)
   if do_create_with_key:
     do_create = True
@@ -930,7 +1004,9 @@ def main(argv):
     else:
       if e[0] == errno.ENOENT:
         e = encfile
-      print >>sys.stderr, 'error: encfile not found (touch it 1st): %s' % e
+      print >>sys.stderr, (
+          'error: encfile not found, create it: %s --create %s' %
+          (argv[0], encfile))
       sys.exit(2)
   if not stat.S_ISREG(ste.st_mode):
     print >>sys.stderr, 'error: encfile is not a regular file: %s' % encfile
@@ -942,17 +1018,20 @@ def main(argv):
   finally:
     os.close(fd)
   if header:  # Non-empty file.
-    if len(header) != 32 or not header.startswith(HEADER_START):
-      print >>sys.stderr, (
-          'error: unrecognized joenc1 header %s in file: %s' %
-          (header.encode('hex'), encfile))
-      sys.exit(8)
     if header == HEADER_IN_PROGRESS:
       # TODO(pts): Make sure this can't happen, do autorecovery.
       print >>sys.stderr, (
           'error: previous joenc1 died while saving: %s' %
           (header.encode('hex'), encfile))
       sys.exit(8)
+    if not IsHeaderOk(header):
+      print >>sys.stderr, (
+          'error: unrecognized joenc1 header %s in file: %s' %
+          (header.encode('hex'), encfile))
+      sys.exit(8)
+    is_ssh_only = header.startswith(HEADER_START_SSHONLY)
+  else:
+    is_ssh_only = do_create_with_key
 
   signature = fixup = random = public_key_base64 = None
   if key_to_add is not None:
@@ -1007,7 +1086,7 @@ def main(argv):
       need_verify = True
       if middle is None:
         if header:
-          # !! no prompt if header says so; here and elsewhere
+          CheckNotSshOnly(is_ssh_only, encfile)
           passphrase = PromptPassphrase('joenc1 passphrase of %r: ' % encfile)
         else:
           print >>sys.stderr, 'info: generating random passphrase'
@@ -1069,30 +1148,18 @@ def main(argv):
       sys.exit(7)
 
   if signature is None and header:
-    signature, fixup, random, public_key_base64 = ReadRsaInfo(
-        encfile, do_getfixup)
+    signature, fixup, random, public_key_base64 = ReadRsaInfo(encfile, False)
 
-  if signature is None or do_getfixup:
-    # !! Add flag to prevent the passphrase prompt.
+  if signature is None:
+    CheckNotSshOnly(is_ssh_only, encfile)
     if not header:
       if is_new:
         prompt = 'joenc1 new passphrase of new %r: ' % encfile
       else:
         prompt = 'joenc1 new passphrase of empty %r: ' % encfile
-    elif do_getfixup:
-      if signature is None:
-        print >>sys.stderr, 'error: getfixup without matching signature'
-        sys.exit(10)
-      prompt = 'joenc1 passphrase for getfixup of %r: ' % encfile
     else:
       prompt = 'joenc1 passphrase of %r: ' % encfile
     passphrase = PromptPassphrase(prompt)
-    if do_getfixup:
-      fixup = GetFixup(PreprocessToMiddle(passphrase), signature)
-      # !! TODO(pts): Emit the comment part of the key etc.
-      akeys_line = 'fixup=%s random=%s ssh-rsa %s %s\n' % (
-          fixup.encode('hex'), random.encode('hex'),
-          public_key_base64, '-')
     passphrasen = PreprocessPassphrase(passphrase)
     if not header:  # Empty file.
       try:
@@ -1122,7 +1189,7 @@ def main(argv):
   passphrase_requester = InstantPassphraseRequester(pp_write_fd, passphrasen)
 
   if not header and (do_create or do_run_joe):
-    WriteCrypt(encfile, (), passphrase_requester, passphrase_fd)
+    WriteCrypt(encfile, (), passphrase_requester, passphrase_fd, is_ssh_only)
     print >>sys.stderr, 'info: created with empty plaintext: %s' % encfile
 
   try:
@@ -1146,19 +1213,17 @@ def main(argv):
 
   if do_run_joe:
     RunJoe(argv, encfile_i, encfile, pp_write_fd, passphrase_fd, passphrasen,
-           joe_prog)
-  elif do_getfixup:
-    # !! TODO(pts): Emit the whole key line, or update encfile + '.akeys'.
-    # TODO(pts): Insert it to the .akeys file automatically.
-    sys.stdout.write(akeys_line)
+           joe_prog, is_ssh_only)
   elif do_create:
     if header:
-      print >>sys.stderr, 'info: encfile verified OK, kept intact: %s' % encfile
+      print >>sys.stderr, 'info: encfile verified OK, kept intact: %s' % (
+          encfile)
   elif do_encrypt:
-    size = WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd)
+    size = WriteCrypt(encfile, FdSource(0), passphrase_requester,
+                      passphrase_fd, is_ssh_only)
     print >>sys.stderr, 'info: encrypted %d plaintext bytes to: %s' % (
         size, encfile)
-    
+
   # TODO(pts): Close pp_write_fd etc.
 
 
