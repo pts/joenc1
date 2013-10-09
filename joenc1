@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 # by pts@fazekas.hu at Sun Jun  6 18:06:47 CEST 2010
 
-"""Start joe(1) opening and encrypting a single file.
+"""Start joe(1) opening and encrypting a single file. !! fix for non-joe
 
 Example old command:
 
@@ -11,13 +11,13 @@ Example new command, with automatic decryption on load and encryption on save.
 
   $ touch encrypted-file1
   $ joenc1 [-beep] encrypted-file1 file2 file3
-  joenc1 passphrase for 'encrypted-file1':
+  joenc1 new passphrase for 'encrypted-file1':
 
 Example setup for SSH signing:
 
   # Create encrypted-file1 just as above (pick a passphrase, can be random).
   # Start ssh-agent and make sure you have a working $SSH_AUTH_SOCK .
-  # Don't put whitespace in the comment below:
+  # Don't put whitespace in the comment below:  !! why no whitespace?
   $ ssh-keygen -t rsa -b 4096 -C 'my-joenc1-key' -f keyfile
   # You may or may not have an SSH key passphrase here.
   $ ssh-add keyfile
@@ -27,7 +27,7 @@ Example setup for SSH signing:
   # Copy-paste the printed output back to encrypted-file1.
   $ joenc1 encrypted-file1
   # This should not ask for the encrypted-file1 passphrase (but it should
-  # for the SSH key passphrase).
+  # for the SSH key passphrase if not added to the agent).
 """
 
 __author__ = 'pts@fazekas.hu (Peter Szabo)'
@@ -51,6 +51,10 @@ import time
 import traceback
 
 
+class Error(Exception):
+  """Common base class for exceptions defined in this module."""
+
+
 # SHA-1 (160 bit output), available since Python2.4 (or earlier).
 try:
   import hashlib  # No deprecation warning in Python 2.6.
@@ -70,20 +74,31 @@ m.update('mymsg')
 assert 'c387b401c957209a84d581a23247f9199292a052' == m.hexdigest()
 
 
+HEADER_START_V1 = '\0J1\x1A.'  # Old file format.
+HEADER_START = '\0J1\x1A/'
+# The byte '/' denotes the file version, and '56789AB' are unused.
+HEADER_IN_PROGRESS = '\0J1\x1A/56789AB((((SHA1CHECKSUM))))'
 
-HEADER_START = '\0J1\x1A/'  # '.' is the first version.
 
-PASSPHRASE_FD = 62
-"""File descriptor openssl can read to get the passphrase."""
+def PassphraseSender(np_read_fd, pp_write_fd, passphrasen):
+  """Waits for a passphrase to be required, sends it infinite loop.
 
-def PassphraseSender(read_fd, write_fd, passphrasen):
+  Timeline of one loop iteration:
+
+  1. Client sends 'W' to np_write_fd.
+  2. PassphraseSender receives the 'W' in np_read_fd.
+  3. PassphraseSender sends the passphrase + '\n' to pp_write_fd.
+  4. Client receives the passphrase + '\n' on passphrase_fd. 
+  """
   # Exceptions raised here a lost (not reported to joe).
   if not isinstance(passphrasen, str):
     raise TypeError
-  while True:
-    os.read(read_fd, 1)
-    got = os.write(write_fd, passphrasen)
+  while 1:
+    os.read(np_read_fd, 1)
+    # Not calling WriteAll, on purpose, to guarantee atomicity.
+    got = os.write(pp_write_fd, passphrasen)
     assert got == len(passphrasen)
+
 
 def ErrorWrapper(function, *args, **kwargs):
   try:
@@ -94,89 +109,158 @@ def ErrorWrapper(function, *args, **kwargs):
     traceback.print_exception(typ, exc, tb.tb_next)
     return None
 
-def JoeFileWorker(np_write_fd, encfile):
+
+def FdSource(fd):
+  while 1:
+    data = os.read(fd, 8192)
+    if not data:
+      break
+    yield data
+
+
+def WriteAll(fd, output):
+  """Write an str or buffer to a file descriptor."""
+  if not isinstance(output, (str, buffer)):
+    raise TypeError
+  if output:
+    got = os.write(fd, output)
+    while got < len(output):
+      output = buffer(output, got)
+      got = os.write(fd, output)
+  #os.write(1, 'READ FILE TO JOE')
+
+
+def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd):
+  """Write encrypted version of source to encfile.
+
+  Returns:
+    The number of plaintext bytes written."""
+  passphrase_requester()
+  passphrasen = os.read(passphrase_fd, 4096)
+  i = passphrasen.find('\n')
+  assert i == len(passphrasen) - 1
+  hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
+  passphrasen = None  # Don't remember it too long.
+  passphrase_requester()
+  # TODO(pts): To prevent data loss, create a temporary file, write to it,
+  # and move it on success. Also add O_CREAT.
+  fd = os.open(encfile, os.O_WRONLY | os.O_TRUNC, 0644)
+  size = 0
+  try:
+    # Write the header.
+    assert 32 == os.write(fd, HEADER_IN_PROGRESS)
+    p = subprocess.Popen(
+        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-pass',
+         'fd:%d' % passphrase_fd),
+        stdin=subprocess.PIPE, stdout=fd)
+    try:
+      for data in source:
+        size += len(data)
+        hmac_obj.update(data)
+        p.stdin.write(data)
+        p.stdin.flush()
+    finally:
+      p.stdin.close()
+      exit_code = p.wait()
+    assert not exit_code, 'openssl encrypt failed with exit_code=%r' % exit_code
+    os.lseek(fd, 12, 0)
+    assert 20 == os.write(fd, hmac_obj.digest())
+    return size
+  finally:
+    os.close(fd)
+
+
+class ReadCryptError(Error):
+  """Raised on a crypto error when reading an encrypted file."""
+
+
+class ReadCryptOpensslError(ReadCryptError):
+  """Raised when openssl has failed decrypting."""
+
+
+class ReadCryptHmacError(ReadCryptError):
+  """Raised at a HMAC mismatch when decrypting."""
+
+
+def FdPassphraseRequester(np_write_fd):
+  def FdRequest():
+    os.write(np_write_fd, 'W')
+  
+  return FdRequest
+
+
+def InstantPassphraseRequester(pp_write_fd, passphrasen):
+  def InstantRequest():
+    # Not calling WriteAll, on purpose, to guarantee atomicity.
+    got = os.write(pp_write_fd, passphrasen)
+    assert got == len(passphrasen)
+
+  return InstantRequest  
+
+
+def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
+  """Read and decrypt encfile, return the full plaintext."""
+  fd = os.open(encfile, os.O_RDONLY)
+  try:
+    header = os.read(fd, 32)
+    if not header:
+      return ''
+    if len(header) != 32 or not header.startswith(HEADER_START):
+      assert 0, ('error: unrecognized header %s' %
+                 header.encode('hex'))
+    expected_hmac = header[12 : 32]
+    passphrase_requester()
+    passphrasen = os.read(passphrase_fd, 4096)
+    i = passphrasen.find('\n')
+    assert i == len(passphrasen) - 1
+    hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
+    passphrasen = None  # Don't rememer it to olong.
+    # Ask the parent to write the passphrase for openssl below.
+    passphrase_requester()
+    p = subprocess.Popen(
+        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-d', '-pass',
+         'fd:%d' % passphrase_fd),
+        stdin=fd, stdout=subprocess.PIPE)
+    try:
+      plaintext = []
+      while 1:
+        data = p.stdout.read(8192)
+        if not data:
+          break
+        hmac_obj.update(data)
+        if need_plaintext:
+          plaintext.append(data)
+    finally:
+      exit_code = p.wait()
+    got_hmac = hmac_obj.digest()
+    if expected_hmac != got_hmac:
+      # Don't write anything until hmac is proven correct.
+      # We may also display an OpenSSL error above.
+      raise ReadCryptHmacError
+    if exit_code:
+      raise ReadCryptOpensslError(
+          'openssl decrypt failed with exit_code=%r' % exit_code)
+    return ''.join(plaintext)
+  finally:
+    os.close(fd)
+
+
+def JoeFileWorker(np_write_fd, passphrase_fd, encfile):
   """Called when this program was invoked by joe through `!file'."""
   tty_fd = os.open('/dev/tty', os.O_WRONLY)
   if tty_fd != 2:
     os.dup2(tty_fd, 2)
     os.close(tty_fd)
-
+  passphrase_requester = FdPassphraseRequester(np_write_fd)
   try:
     st0 = os.fstat(0)
     st1 = os.fstat(1)
     if stat.S_ISFIFO(st1.st_mode) and not stat.S_ISFIFO(st0.st_mode):
-      fd = os.open(encfile, os.O_RDONLY)
-      header = os.read(fd, 32)
-      if header:
-        if len(header) < 32 or not header.startswith(HEADER_START):
-          assert 0, ('error: unrecognized header %s' %
-                     header.encode('hex'))
-        expected_hmac = header[12 : 32]
-        os.write(np_write_fd, 'W')
-        passphrasen = os.read(PASSPHRASE_FD, 4096)
-        i = passphrasen.find('\n')
-        assert i == len(passphrasen) - 1
-        hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
-        passphrasen = None
-        if fd > 9:  # Some shells (e.g. dash) can't redirect to multi-digit.s
-          os.dup2(fd, 3)
-          os.close(fd)
-          fd = 3
-        # Ask the parent to write the passphrase for openssl below.
-        os.write(np_write_fd, 'W')
-        rf = os.popen(
-            'openssl enc -aes-256-cbc -salt -d -pass fd:%s <&%d' %
-            (PASSPHRASE_FD, fd), 'r')
-        rfd = rf.fileno()
-        output = []
-        while True:
-          data = os.read(rfd, 8192)
-          if not data:
-            break
-          hmac_obj.update(data)
-          output.append(data)
-        got_hmac = hmac_obj.digest()
-        if  expected_hmac != got_hmac:
-          # Don't write anything until hmac is proven correct.
-          # We may also display an OpenSSL error above.
-          assert 0, 'hmac mismatch: %s' % encfile
-        output = ''.join(output)
-        got = os.write(1, output)
-        while got < len(output):
-          output = buffer(output, got)
-          got = os.write(1, output)
-        #os.write(1, 'READ FILE TO JOE')
+      WriteAll(1, ReadCrypt(encfile, passphrase_requester, passphrase_fd, True))
     elif stat.S_ISFIFO(st0.st_mode) and not stat.S_ISFIFO(st1.st_mode):
       # TODO(pts): Better write error handling.
       #open('save.dat', 'w').write(time.ctime() + '\n' + sys.stdin.read())
-      os.write(np_write_fd, 'W')
-      passphrasen = os.read(PASSPHRASE_FD, 4096)
-      i = passphrasen.find('\n')
-      assert i == len(passphrasen) - 1
-      hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
-      passphrasen = None
-      os.write(np_write_fd, 'W')
-      # Write the header.
-      fd = os.open(encfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0644)
-      if fd != 1:
-        os.dup2(fd, 1)
-        os.close(fd)
-      assert 32 == os.write(1, '\0J1\x1A/56789AB((((SHA1CHECKSUM))))')
-      wf = os.popen(
-          'openssl enc -aes-256-cbc -salt -pass fd:%s' % PASSPHRASE_FD, 'w')
-      wfd = wf.fileno()
-      while True:
-        data = os.read(0, 8192)
-        if not data:
-          break
-        hmac_obj.update(data)
-        got = os.write(wfd, data)
-        while got < len(data):
-          data = buffer(data, got)
-          got = os.write(wfd, data)
-      assert not wf.close(), 'openssl failed'
-      os.lseek(1, 12, 0)
-      assert 20 == os.write(1, hmac_obj.digest())
+      WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd)
       # TODO(pts): Better error reporting on assertion failure here.
     else:
       assert 0, 'error: invalid pipe invocation'
@@ -191,11 +275,15 @@ def JoeFileWorker(np_write_fd, encfile):
         os.write(2, 'joenc1 ERROR: %s\r' % exc)
       else:
         os.write(2, 'joenc1 EXC: %s: %s\r' % (type(exc).__name__, exc))
+      traceback.print_exc()
       os._exit(3)
 
-def ShowUsage(): 
+
+def ShowUsage():
+  # !! show more
   print >>sys.stderr, (
       'Usage: %s [<joe-flag> ...] <encfile> [<file> ...]' % sys.argv[0])
+
 
 def QuoteShellWord(word):
   """Quote a word from /bin/sh (Bourne shell)."""
@@ -232,6 +320,7 @@ def PreprocessPassphrase(passphrase):
   data = passphrase
   for i in xrange(PREP['num_iterations']):
     data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  assert len(data) == 40
   return data.encode('base64').rstrip('\n')
 
 
@@ -246,7 +335,7 @@ def PreprocessRsaSignature(signature, fixup):
   assert len(signature) >= 40
   salt1 = PREP['salt1_rsa']
   salt2 = PREP['salt2_rsa']
-  data = signature[-40:]
+  data = signature[-40:]  # TODO(pts): Don't we want the whole signature?
   n1 = PREP['num_iterations_before_rsa_fix']
   n2 = PREP['num_iterations']
   # It would work (but may be cryptographically weaker with <= instead of <).
@@ -489,58 +578,32 @@ def ReadRsaInfo(encfile, is_plain_ok):
           found_random, found_public_key_base64)
 
 
-if __name__ == '__main__':
-  if (os.getenv('JOENC1_FILE_WORKER', None) is not None and
-      len(sys.argv) == 2):
-    sys.exit(JoeFileWorker(int(os.getenv('JOENC1_FILE_WORKER')), sys.argv[1]))
+def FindJoeBinaryPath():
+  """Finds the joe binary on $PATH and returns the pathname, or None."""
+  return (FindOnPath('joe-p37') or
+          FindOnPath('joe-p35') or
+          FindOnPath('joe.mc') or
+          FindOnPath('joe'))
 
-  argv = list(sys.argv)
 
-  if len(argv) <= 1 or argv[1] == '--help':
-    ShowUsage()
-    sys.exit(0)
-
-  do_getfixup = False
-  i = 1
-  while i < len(argv):
-    if argv[i] == '-getfixup':
-      del argv[i]
-      do_getfixup = True
-      continue
-    if not argv[i].startswith('-') or argv[i] == '-':
-      break
-    i += 1
-  if i >= len(argv):
-    print >>sys.stderr, 'error: encfile not specified'
-    ShowUsage()
-    sys.exit(1)
-
-  encfile = argv[i]
-  encfile_i = i
+def GetMyBinaryPath(argv0):
+  """Figure out and return the full path to this joenc1 binary."""
+  myprog = os.path.abspath(argv0)
+  assert '\0' not in myprog, repr(myprog)
+  assert myprog.startswith('/'), repr(myprog)
   try:
-    ste = os.stat(encfile)
-  except OSError, e:
-    print >>sys.stderr, 'error: encfile not found (touch it 1st): %s' % e
+    stp = os.stat(myprog)
+  except OSError:
+    print >>sys.stderr, 'error: my binary not found: %s' % myprog
     sys.exit(2)
-  if not stat.S_ISREG(ste.st_mode):
-    print >>sys.stderr, 'error: encfile is not a regular file: %s' % encfile
+  if not stat.S_ISREG(stp.st_mode) or (stp.st_mode & 0100) == 0:
+    print >>sys.stderr, 'error: my binary is not executable: %s' % myprog
     sys.exit(2)
+  return myprog
 
-  fd = os.open(encfile, os.O_RDONLY)
-  header = os.read(fd, 32)
-  if header:  # Non-empty file.
-    if len(header) < 32 or not header.startswith(HEADER_START):
-      print >>sys.stderr, (
-          'error: unrecognized joenc1 header %s in file: %s' %
-          (header.encode('hex'), encfile))
-      sys.exit(8)
 
-  # TODO(pts): Check against EUID.
-  if os.access(encfile, os.W_OK):
-    rdonly_flag = '--rdonly'  # read-write
-  else:
-    rdonly_flag = '-rdonly'  # read-only
-
+def CheckTerminals():
+  """Check that stdin, stdout, stderr filehandles are good terminal devices."""
   if not os.isatty(2):
     print >>sys.stderr, 'error: stderr must be a terminal'
     sys.exit(2)
@@ -557,47 +620,143 @@ if __name__ == '__main__':
       st0.st_dev != st2.st_dev):
     print >>sys.stderr, 'error: stdin and stderr are not the same terminals'
     sys.exit(2)
-  myprog = os.path.abspath(argv[0])
-  assert '\0' not in myprog
-  assert myprog.startswith('/')
-  if re.match(r'[-:,~@%^={}+@/.\w]+\Z', myprog):
-    myprog_quoted = myprog
+
+
+def RunJoe(argv, encfile_i, encfile, pp_write_fd, passphrase_fd, passphrasen,
+           joe_prog):
+  """Runs joe, does not return (calls sys.exit)."""
+  # TODO(pts): Check against EUID.
+  if os.access(encfile, os.W_OK):
+    rdonly_flag = '--rdonly'  # read-write
   else:
-    myprog_quoted = "'%s'" % myprog.replace("'", "'\\''")
+    rdonly_flag = '-rdonly'  # read-only
+
+  myprog = GetMyBinaryPath(argv[0])  # Can fail.
+  joe_cmd = list(argv)
+  joe_cmd[0] = joe_prog
+  joe_cmd[encfile_i] = '!%s %s' % (
+      QuoteShellWord(myprog), QuoteShellWord(encfile))
+  joe_cmd[encfile_i + 1 : encfile_i + 1] = [rdonly_flag]
+
+  # The need-password pipe.
+  np_read_fd, np_write_fd = os.pipe()
+  fcntl.fcntl(np_read_fd, fcntl.F_SETFD,
+              fcntl.fcntl(np_read_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+  os.environ['JOENC1_FILE_WORKER'] = '%d:%d' % (np_write_fd, passphrase_fd)
+
+  p = subprocess.Popen(joe_cmd)
+  # TODO(pts): Solve this without threads.
+  thread.start_new_thread(
+      ErrorWrapper, (PassphraseSender, np_read_fd, pp_write_fd, passphrasen))
+  sys.exit(p.wait())
+
+
+def main(argv):
+  if (os.getenv('JOENC1_FILE_WORKER', None) is not None and
+      len(sys.argv) == 2):
+    np_write_fd, passphrase_fd = map(
+        int, os.getenv('JOENC1_FILE_WORKER').split(':', 1))
+    sys.exit(JoeFileWorker(np_write_fd, passphrase_fd, sys.argv[1]))
+
+  argv = list(argv)
+
+  if len(argv) <= 1 or argv[1] == '--help':
+    ShowUsage()
+    sys.exit(0)
+
+  do_run_joe = None
+  do_getfixup = False
+  do_create = False  # Do create if doesn't exist, don't start joe.
+  do_encrypt = False
+  do_decrypt = False
+  i = 1
+  while i < len(argv):
+    arg = argv[i]
+    if arg in ('-getfixup', '--getfixup'):
+      do_getfixup = True
+    elif arg in ('-create', '--create'):
+      do_create = True
+    elif arg in ('-encrypt', '--encrypt'):
+      do_encrypt = True
+    elif arg in ('-decrypt', '--decrypt'):
+      do_decrypt = True
+    elif arg == '--':
+      i += 1
+      break
+    elif not arg.startswith('-') or arg == '-':
+      break
+    i += 1
+  if i >= len(argv):
+    print >>sys.stderr, 'error: encfile not specified'
+    ShowUsage()
+    sys.exit(1)
+  dosum = do_create + do_getfixup + do_encrypt + do_decrypt
+  if do_run_joe is None:
+    do_run_joe = not dosum
+  if do_run_joe + dosum != 1:
+    print >>sys.stder, 'error: invalid combination of action flags'
+    ShowUsage()
+    sys.exit(1)
+
+  encfile = argv[i]
+  encfile_i = i
+  is_new = False
   try:
-    stp = os.stat(myprog)
-  except OSError:
-    print >>sys.stderr, 'error: my binary not found: %s' % myprog
-    sys.exit(2)
-  if not stat.S_ISREG(stp.st_mode) or (stp.st_mode & 0100) == 0:
-    print >>sys.stderr, 'error: my binary is not executable: %s' % myprog
-    sys.exit(2)
-  try:
-    os.fstat(PASSPHRASE_FD)
-    e = None
+    ste = os.stat(encfile)
   except OSError, e:
-    if e.errno != errno.EBADF:
-      raise
-  if not e:
-    print >>sys.stderr, 'error: file descriptor used: %d' % PASSPHRASE_FD
+    if e[0] == errno.ENOENT and do_create:
+      fd = os.open(encfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0644)
+      try:
+        ste = os.fstat(fd)
+      finally:
+        os.close(fd)
+      is_new = True
+    else:
+      if e[0] == errno.ENOENT:
+        e = encfile
+      print >>sys.stderr, 'error: encfile not found (touch it 1st): %s' % e
+      sys.exit(2)
+  if not stat.S_ISREG(ste.st_mode):
+    print >>sys.stderr, 'error: encfile is not a regular file: %s' % encfile
     sys.exit(2)
 
-  joe_prog = (FindOnPath('joe-p37') or
-              FindOnPath('joe-p35') or
-              FindOnPath('joe.mc') or
-              FindOnPath('joe'))
-  if not joe_prog:
-    print >>sys.stderr, 'error: joe: command not found'
-    sys.exit(7)
+  fd = os.open(encfile, os.O_RDONLY)
+  try:
+    header = os.read(fd, 32)
+  finally:
+    os.close(fd)
+  if header:  # Non-empty file.
+    if len(header) != 32 or not header.startswith(HEADER_START):
+      print >>sys.stderr, (
+          'error: unrecognized joenc1 header %s in file: %s' %
+          (header.encode('hex'), encfile))
+      sys.exit(8)
+    if header == HEADER_IN_PROGRESS:
+      # TODO(pts): Make sure this can't happen, do autorecovery.
+      print >>sys.stderr, (
+          'error: previous joenc1 died while saving: %s' %
+          (header.encode('hex'), encfile))
+      sys.exit(8)
+
+  if do_run_joe:
+    CheckTerminals()
+    joe_prog = FindJoeBinaryPath()
+    if not joe_prog:
+      print >>sys.stderr, 'error: joe: command not found'
+      sys.exit(7)
 
   if header:
-    signature, fixup, random, public_key_base64 = ReadRsaInfo(encfile, do_getfixup)
+    signature, fixup, random, public_key_base64 = ReadRsaInfo(
+        encfile, do_getfixup)
   else:
     signature = fixup = random = public_key_base64 = None
 
   if signature is None or do_getfixup:
     if not header:
-      prompt = 'joenc1 new passphrase of empty %r: ' % encfile
+      if is_new:
+        prompt = 'joenc1 new passphrase of new %r: ' % encfile
+      else:
+        prompt = 'joenc1 new passphrase of empty %r: ' % encfile
     elif do_getfixup:
       if signature is None:
         print >>sys.stderr, 'error: getfixup without matching signature'
@@ -616,7 +775,7 @@ if __name__ == '__main__':
     passphrase = passphrase.strip()
     if do_getfixup:
       fixup = GetFixup(passphrase, signature)
-      # TODO(pts): Emit the whole key line, or update encfile + '.akeys'.
+      # !! TODO(pts): Emit the comment part of the key etc.
       akeys_line = 'fixup=%s random=%s ssh-rsa %s %s\n' % (
           fixup.encode('hex'), random.encode('hex'),
           public_key_base64, '-')
@@ -642,67 +801,53 @@ if __name__ == '__main__':
   assert '\n' not in passphrasen
   passphrasen += '\n'
 
-  if header:  # Non-empty file.
-    # Create passphrase pipe for openssl below.
-    pp_read_fd, pp_write_fd = os.pipe()
-    if pp_read_fd != PASSPHRASE_FD:
-      if pp_write_fd == PASSPHRASE_FD:
-        pp_write_fd = os.dup(pp_write_fd)
-      os.dup2(pp_read_fd, PASSPHRASE_FD)
-      os.close(pp_read_fd)
-      pp_read_fd = PASSPHRASE_FD
-    # pp_read_fd has ~FD_CLOEXEC by default, we don't have to change that.
-    fcntl.fcntl(pp_write_fd, fcntl.F_SETFD,
-                fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+  # Create passphrase pipe for openssl below.
+  passphrase_fd, pp_write_fd = os.pipe()
+  # passphrase_fd has ~FD_CLOEXEC by default, we don't have to change that.
+  fcntl.fcntl(pp_write_fd, fcntl.F_SETFD,
+              fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+  passphrase_requester = InstantPassphraseRequester(pp_write_fd, passphrasen)
 
-    # Start openssl to decrypt the file in order to compute the hmac.
-    expected_hmac = header[12 : 32]
-    assert len(passphrasen) == os.write(pp_write_fd, passphrasen)
-    if fd > 9:  # TODO(pts): Restore this after os.system
-      os.dup2(fd, 3)
-      os.close(fd)
-      fd = 3
-    rf = os.popen(
-        'openssl enc -aes-256-cbc -salt -d -pass fd:%s <&%d' %
-        (PASSPHRASE_FD, fd), 'r')
-    rfd = rf.fileno()
-    hmac_obj = hmac.new(passphrasen[:-1], None, sha1_module)
-    while True:
-      data = os.read(rfd, 8192)
-      if not data:
-        break
-      hmac_obj.update(data)
-    got_hmac = hmac_obj.digest()
-    if expected_hmac != got_hmac:
-      # We may also display an OpenSSL error above.
-      print >>sys.stderr, 'error: hmac mismatch (bad passphrase?): %s' % (
-          encfile)
-      sys.exit(9)
-    del hmac_obj
-    status = rf.close() or 0
-    if status:
-      # This doesn't always detect the failure, sometimes it just decrypts the
-      # wrong data (we'd need file integrity protection).
-      print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
-      sys.exit((status >> 8) or 5)
-  os.close(fd)
+  if not header and (do_create or do_run_joe):
+    WriteCrypt(encfile, (), passphrase_requester, passphrase_fd)
+    print >>sys.stderr, 'info: created with empty plaintext: %s' % encfile
 
-  if do_getfixup:
+  try:
+    if do_decrypt:
+      # Don't write anything until verified.
+      plaintext = ReadCrypt(encfile, passphrase_requester, passphrase_fd, True)
+      WriteAll(1, plaintext)
+    else:
+      ReadCrypt(encfile, passphrase_requester, passphrase_fd, False)
+  except ReadCryptHmacError:
+    # This doesn't always detect the failure, sometimes it just decrypts the
+    # wrong data, that's why we have integrity protection with the hmac above.
+    print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
+    sys.exit(5)
+  except ReadCryptOpensslError:
+    # In addition to this error, the `openssl' command may also display a
+    # decryption error above. But it doesn't always do so.
+    print >>sys.stderr, 'error: hmac mismatch (bad passphrase?): %s' % (
+        encfile)
+    sys.exit(9)
+
+  if do_run_joe:
+    RunJoe(argv, encfile_i, encfile, pp_write_fd, passphrase_fd, passphrasen,
+           joe_prog)
+  elif do_getfixup:
+    # !! TODO(pts): Emit the whole key line, or update encfile + '.akeys'.
     # TODO(pts): Insert it to the .akeys file automatically.
     sys.stdout.write(akeys_line)
-    sys.exit(0)
+  elif do_create:
+    if header:
+      print >>sys.stderr, 'info: encfile verified OK, kept intact: %s' % encfile
+  elif do_encrypt:
+    size = WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd)
+    print >>sys.stderr, 'info: encrypted %d plaintext bytes to: %s' % (
+        size, encfile)
+    
+  # TODO(pts): Close pp_write_fd etc.
 
-  # The need-password pipe.
-  np_read_fd, np_write_fd = os.pipe()
-  fcntl.fcntl(np_read_fd, fcntl.F_SETFD,
-              fcntl.fcntl(np_read_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
 
-  os.environ['JOENC1_FILE_WORKER'] = str(np_write_fd)
-  joe_cmd = ([joe_prog] + argv[1 : encfile_i] + [rdonly_flag] +
-             ['!%s %s' % (QuoteShellWord(myprog), QuoteShellWord(encfile))] +
-             argv[encfile_i + 1:])
-  p = subprocess.Popen(joe_cmd)
-  # TODO(pts): Solve this without threads.
-  thread.start_new_thread(
-      ErrorWrapper, (PassphraseSender, np_read_fd, pp_write_fd, passphrasen))
-  sys.exit(p.wait())
+if __name__ == '__main__':
+  sys.exit(main(sys.argv))
