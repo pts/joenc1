@@ -17,6 +17,7 @@ Example setup for SSH signing:
 
   # Create encrypted-file1 just as above (pick a passphrase, can be random).
   # Start ssh-agent and make sure you have a working $SSH_AUTH_SOCK .
+  # Create your SSH keypair. Make sure it's RSA (-t rsa).
   # Don't put whitespace in the comment below:  !! why no whitespace?
   $ ssh-keygen -t rsa -b 4096 -C 'my-joenc1-key' -f keyfile
   # You may or may not have an SSH key passphrase here.
@@ -348,6 +349,7 @@ def PreprocessRsaSignature(signature, fixup):
   salt2 = PREP['salt2']
   for i in xrange(n1, n2):
     data = sha1(salt1 + data).digest() + sha1(data + salt2).digest()
+  # 40 bytes before base64, 56 bytes after.
   return data.encode('base64').rstrip('\n')
 
 
@@ -396,16 +398,120 @@ def RecvAll(sock, size):
     size -= len(output[-1])
   return ''.join(output)
 
+
 def RecvU32(sock):
   return struct.unpack('>L', RecvAll(sock, 4))[0]
 
+
 def RecvStr(sock):
   return RecvAll(sock, RecvU32(sock))
+
 
 def AppendStr(ary, data):
   assert isinstance(data, str)
   ary.append(struct.pack('>L', len(data)))
   ary.append(data)
+
+
+def YieldSshAgentRsaKeys(sock=None):
+  if sock is None:
+    if os.getenv('SSH_AUTH_SOCK', ''):
+      sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+    try:
+      sock.connect(os.getenv('SSH_AUTH_SOCK'))
+    except socket.error, e:
+      sock = None
+  if sock is not None:  # Silently ignore sock is None.
+    sock.sendall('\0\0\0\1\v') # SSH2_AGENTC_REQUEST_IDENTITIES
+    response = RecvStr(sock)
+    resf = cStringIO.StringIO(response)
+    assert RecvAll(resf, 1) == chr(SSH2_AGENT_IDENTITIES_ANSWER)
+    num_keys = RecvU32(resf)
+    assert num_keys < 2000  # A quick sanity check.
+    # TODO(pts): Make this work again.
+    #if not num_keys:
+    #  print >>sys.stderr, 'warning: no keys have_been added to ssh-agent'
+    #  return None, None, None, None
+    # Please note that the SSH agent in Ubuntu Lucid doesn't store the
+    # original SSH key comment, but it stores the absolute local filename of
+    # the private key.
+    for i in xrange(num_keys):
+      key = RecvStr(resf)
+      comment_or_filename = RecvStr(resf)
+      if not key.startswith('\x00\x00\x00\x07ssh-rsa\x00\x00'):
+        continue
+      keyf = cStringIO.StringIO(key[11:])
+      public_exponent = int(RecvStr(keyf).encode('hex'), 16)
+      modulus_str = RecvStr(keyf)
+      modulus = int(modulus_str.encode('hex'), 16)
+      assert '' == keyf.read(1), 'EOF expected in keyf'
+      yield public_exponent, modulus, comment_or_filename, key
+    assert '' == resf.read(1), 'EOF expected in resf'
+  # TODO(pts): Do an explicit sock.close if we've just opened it.
+
+
+def ParseRsaPublicKey(line):
+  """Parses an RSA key from a line in ~/.ssh/id_*.pub or authorized_keys.
+
+  Returns:
+    A dict describing the results or None if key not found.
+  """
+  line = line.strip()
+  if line.startswith('#') or not line:
+    return None
+  # !! TODO(pts): Support spaces in the comment section (ssh-keygen
+  # supports it).
+  items = line.split()
+  i = 0
+  h = {}
+  while i < len(items):
+    match = re.match(r'([^\s=]+)=("([^"]*)"|\S+)\Z', items[i])
+    if not match:
+      break
+    if match.group(3) is not None:
+      h[match.group(1)] = match.group(3)
+    else:
+      h[match.group(1)] = match.group(2)
+    i += 1
+  if i != len(items) - 3 or items[i] != 'ssh-rsa':
+    return None
+  comment = items[i + 2]
+  public_key_base64 = items[i + 1]
+  public_key = base64.b64decode(public_key_base64)
+  # Now public_key_base64 is the base64-encoded version of the public
+  # key, i.e. the long word starting with AAAA... after 'ssh-rsa ' in
+  # ~/.ssh/id_*.pub and ~/.ssh/authorized_keys.
+  if h.get('random', '?') == '?':
+    random = None
+  else:
+    assert re.match('[0-9a-fA-F]{80}\Z', h['random'])
+    random = h['random'].decode('hex')
+  if h.get('fixup', '?') == '?':
+    fixup = None
+  else:
+    assert re.match('[0-9a-fA-F]{80}\Z', h['fixup'])
+    fixup = h['fixup'].decode('hex')
+  # Decode the SSH2 RSA public key.
+  assert public_key.startswith('\0\0\0\7ssh-rsa\0\0')
+  assert len(public_key) >= 15
+  public_exponent_size = struct.unpack('>L', public_key[11 : 15])[0]
+  assert len(public_key) >= 15 + public_exponent_size
+  public_exponent = int(
+      public_key[15 : 15 + public_exponent_size].encode('hex'), 16)
+  i = 15 + public_exponent_size
+  assert len(public_key) >= 4 + i
+  modulus_size = struct.unpack('>L', public_key[i : i + 4])[0]
+  assert len(public_key) == 4 + i + modulus_size
+  modulus = int(
+      public_key[4 + i : 4 + i + modulus_size].encode('hex'), 16)
+  return {  # aitem.
+      'comment': comment,
+      'random': random,
+      'fixup': fixup,
+      'public_exponent': public_exponent,
+      'modulus': modulus,
+      'public_key_base64': public_key_base64,
+  }
 
 
 def ReadRsaInfo(encfile, is_plain_ok):
@@ -421,57 +527,15 @@ def ReadRsaInfo(encfile, is_plain_ok):
   aitems = []
   try:
     for line in f.xreadlines():
-      line = line.strip()
-      if line.startswith('#') or not line:
+      aitem = ParseRsaPublicKey(line)
+      if aitem is None:
         continue
-      # TODO(pts): Support spaces in the comment section (ssh-keygen
-      # supports it).
-      items = line.split()
-      i = 0
-      h = {}
-      while i < len(items):
-        match = re.match(r'([^\s=]+)=(\S+)\Z', items[i])
-        if not match:
-          break
-        h[match.group(1)] = match.group(2)
-        i += 1
-      if i != len(items) - 3 or items[i] != 'ssh-rsa':
-        continue
-      if not is_plain_ok and not (
-          h.get('random', '?') != '?' and h.get('fixup', '?') != '?'):
-        continue
-      comment = items[i + 2]
-      public_key_base64 = items[i + 1]
-      public_key = base64.b64decode(public_key_base64)
-      if h.get('random', '?') == '?':
-        h['random'] = os.urandom(40).encode('hex')
-      if h.get('fixup', '?') == '?':
-        fixup = None
+      if is_plain_ok:
+        if aitem['random'] is None:
+          aitem['random'] = os.urandom(40)  # TODO(pts): Move it later.
       else:
-        assert re.match('[0-9a-fA-F]{80}\Z', h['fixup'])
-        fixup = h['fixup'].decode('hex')
-      assert re.match('[0-9a-fA-F]{80}\Z', h['random'])
-      # Decode the SSH2 public key.
-      assert public_key.startswith('\0\0\0\7ssh-rsa\0\0')
-      assert len(public_key) >= 15
-      public_exponent_size = struct.unpack('>L', public_key[11 : 15])[0]
-      assert len(public_key) >= 15 + public_exponent_size
-      public_exponent = int(
-          public_key[15 : 15 + public_exponent_size].encode('hex'), 16)
-      i = 15 + public_exponent_size
-      assert len(public_key) >= 4 + i
-      modulus_size = struct.unpack('>L', public_key[i : i + 4])[0]
-      assert len(public_key) == 4 + i + modulus_size
-      modulus = int(
-          public_key[4 + i : 4 + i + modulus_size].encode('hex'), 16)
-      aitem = {
-          'comment': comment,
-          'random': h['random'].decode('hex'),
-          'fixup': fixup,
-          'public_exponent': public_exponent,
-          'modulus': modulus,
-          'public_key_base64': public_key_base64,
-      }
+        if aitem['random'] is None or aitem['fixup'] is None:
+          continue
       aitems.append(aitem)
   finally:
     f.close()
@@ -492,29 +556,13 @@ def ReadRsaInfo(encfile, is_plain_ok):
     return None, None, None, None
 
   # Get list of public keys, and find our key.
-  sock.sendall('\0\0\0\1\v') # SSH2_AGENTC_REQUEST_IDENTITIES
-  response = RecvStr(sock)
-  resf = cStringIO.StringIO(response)
-  assert RecvAll(resf, 1) == chr(SSH2_AGENT_IDENTITIES_ANSWER)
-  num_keys = RecvU32(resf)
-  assert num_keys < 2000  # A quick sanity check.
-  if not num_keys:
-    print >>sys.stderr, 'warning: no keys have_been added to ssh-agent'
-    return None, None, None, None
+  #
   # Please note that the SSH agent in Ubuntu Lucid doesn't store the
   # original SSH key comment, but it stores the absolute local filename of
   # the private key. So we just ignore comments.
   is_found = False
-  for i in xrange(num_keys):
-    key = RecvStr(resf)
-    unused_comment_or_filename = RecvStr(resf)
-    if not key.startswith('\x00\x00\x00\x07ssh-rsa\x00\x00'):
-      continue
-    keyf = cStringIO.StringIO(key[11:])
-    public_exponent = int(RecvStr(keyf).encode('hex'), 16)
-    modulus_str = RecvStr(keyf)
-    modulus = int(modulus_str.encode('hex'), 16)
-    assert '' == keyf.read(1), 'EOF expected in keyf'
+  for public_exponent, modulus, unused_comment_or_filename, key in (
+      YieldSshAgentRsaKeys(sock)):
     for aitem in aitems:
       if (aitem['public_exponent'] == public_exponent and
           aitem['modulus'] == modulus):
@@ -525,7 +573,6 @@ def ReadRsaInfo(encfile, is_plain_ok):
         found_random = aitem['random']
         found_public_key_base64 = aitem['public_key_base64']
         break
-  assert '' == resf.read(1), 'EOF expected in resf'
   if not is_found:
     print >>sys.stderr, (
         'warning: keys in ssh-agent not matching any key in: %s' %
@@ -566,9 +613,17 @@ def ReadRsaInfo(encfile, is_plain_ok):
   if len(decoded_hex) & 1:
     decoded_hex = '0' + decoded_hex
   decoded_str = decoded_hex.decode('hex')
+
   # (1024, 1025) is not good, it means that the wrong key is used (??)
+  #modulus_str = RecvStr(keyf)
+  #modulus = int(modulus_str.encode('hex'), 16)
+  modulus_str = '00%x' % modulus
+  if len(modulus_str) % 2 == 1:
+    modulus_str = '0' + modulus_str
+  modulus_str = modulus_str.decode('hex')
   assert len(decoded_str) == len(modulus_str) - 2, (  # e.g. (255, 257)
       len(decoded_str), len(modulus_str))
+
   assert re.match(r'\x01\xFF+\Z', decoded_str[:-36]), 'bad padding found'
   expected_sha1_hex = decoded_hex[-40:]
   msg_sha1_hex = sha1(found_random).hexdigest()
@@ -669,6 +724,8 @@ def main(argv):
   do_create = False  # Do create if doesn't exist, don't start joe.
   do_encrypt = False
   do_decrypt = False
+  do_create_with_key = False
+  key_to_add = None
   i = 1
   while i < len(argv):
     arg = argv[i]
@@ -680,6 +737,10 @@ def main(argv):
       do_encrypt = True
     elif arg in ('-decrypt', '--decrypt'):
       do_decrypt = True
+    elif arg in ('-create-with-key', '--create-with-key') and i + 1 < len(argv):
+      do_create_with_key = True
+      i += 1
+      key_to_add = argv[i]
     elif arg == '--':
       i += 1
       break
@@ -690,13 +751,16 @@ def main(argv):
     print >>sys.stderr, 'error: encfile not specified'
     ShowUsage()
     sys.exit(1)
-  dosum = do_create + do_getfixup + do_encrypt + do_decrypt
+  dosum = do_create + do_getfixup + do_encrypt + do_decrypt + do_create_with_key
   if do_run_joe is None:
     do_run_joe = not dosum
   if do_run_joe + dosum != 1:
     print >>sys.stder, 'error: invalid combination of action flags'
     ShowUsage()
     sys.exit(1)
+  if do_create_with_key:
+    do_create = True
+  #if key_to_add is not None:
 
   encfile = argv[i]
   encfile_i = i
@@ -738,6 +802,65 @@ def main(argv):
           (header.encode('hex'), encfile))
       sys.exit(8)
 
+  signature = fixup = random = public_key_base64 = None
+  if key_to_add is not None:
+    f = open(key_to_add)
+    try:
+      data = f.read()
+    finally:
+      f.close()
+    if data.startswith('-----BEGIN ') and not key_to_add.endswith('.pub'):
+      # Found an SSH2 private key.
+      key_to_add += '.pub'
+      f = open(key_to_add)
+      try:
+        data = f.read()
+      finally:
+        f.close()
+    aitems = filter(None, map(ParseRsaPublicKey, data.split('\n')))
+    if not aitems:
+      print >>sys.stderr, 'error: SSH2 RSA public key not found in: %s' % (
+          key_to_add)
+      sys.exit(11)
+    if len(aitems) > 1:
+      print >>sys.stderr, (
+          'error: multiple SSH2 RSA public keys found in: %s' % key_to_add)
+      sys.exit(11)
+    is_found = False
+    for public_exponent, modulus, unused_comment_or_filename, unused_key in (
+        YieldSshAgentRsaKeys()):
+      if (public_exponent == aitems[0]['public_exponent'] and
+          modulus == aitems[0]['modulus']):
+        is_found = True
+    if not is_found:
+      print >>sys.stderr, 'info: Adding key to ssh-agent.'
+      assert key_to_add.endswith('.pub'), repr(key_to_add)
+      private_key_fn = key_to_add[:-4]  # Remove trailing '.pub'.
+      exit_code = subprocess.call(('ssh-add', '--', private_key_fn))
+      if exit_code:
+        print >>sys.stderr, 'error: ssh-add failed: exit_code=%d' % exit_code
+        sys.exit(12)
+    # !! what if .akeys already contains some valid keys and header is not empty?
+    # Use the existing keys to add the new key.
+    if not header:  # !!
+      print >>sys.stderr, 'info: extending key file: %s.akeys' % encfile
+      # 88 printable bytes, without a newline.
+      passphrase = os.urandom(66).encode('base64').replace('\n', '')
+      akeys_line1 = 'ssh-rsa %s %s\n' % (
+          aitems[0]['public_key_base64'], aitems[0]['comment'])
+      open(encfile + '.akeys', 'w').write(akeys_line1)  # !! append
+      # TODO(pts): Keep other fields in key_to_add.
+      signature, fixup, random, public_key_base64 = ReadRsaInfo(
+          encfile, True)
+      assert signature is not None  # !! better report
+      assert fixup is None
+      fixup = GetFixup(passphrase, signature)
+      del passphrase
+      akeys_line = 'fixup=%s random=%s ssh-rsa %s %s\n' % (
+          fixup.encode('hex'), random.encode('hex'),
+          aitems[0]['public_key_base64'], aitems[0]['comment'])
+      open(encfile + '.akeys', 'w').write(akeys_line)  # !! append
+
   if do_run_joe:
     CheckTerminals()
     joe_prog = FindJoeBinaryPath()
@@ -745,13 +868,12 @@ def main(argv):
       print >>sys.stderr, 'error: joe: command not found'
       sys.exit(7)
 
-  if header:
+  if signature is None and header:
     signature, fixup, random, public_key_base64 = ReadRsaInfo(
         encfile, do_getfixup)
-  else:
-    signature = fixup = random = public_key_base64 = None
 
   if signature is None or do_getfixup:
+    # !! Add flag to prevent the passphrase prompt.
     if not header:
       if is_new:
         prompt = 'joenc1 new passphrase of new %r: ' % encfile
@@ -773,6 +895,7 @@ def main(argv):
       print >>sys.stderr, 'info: interrupted, exiting'
       sys.exit(4)
     passphrase = passphrase.strip()
+    # !! reject empty passphrase
     if do_getfixup:
       fixup = GetFixup(passphrase, signature)
       # !! TODO(pts): Emit the comment part of the key etc.
@@ -796,7 +919,8 @@ def main(argv):
       del passphrase_again
     del passphrase
   else:
-    print >>sys.stderr, 'info: using RSA key'
+    if not do_decrypt:
+      print >>sys.stderr, 'info: using RSA key'
     passphrasen = PreprocessRsaSignature(signature, fixup)
   assert '\n' not in passphrasen
   passphrasen += '\n'
