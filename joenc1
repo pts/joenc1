@@ -190,9 +190,11 @@ def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd,
   try:
     # Write the header.
     assert 32 == os.write(fd, HEADER_IN_PROGRESS)
+    # `-md sha1' is better than `-md md5', but the latter is used explicitly
+    # for decrypting files created by older versions of openssl.
     p = subprocess.Popen(
-        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-pass',
-         'fd:%d' % passphrase_fd),
+        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-md', 'md5',
+         '-pass', 'fd:%d' % passphrase_fd),
         stdin=subprocess.PIPE, stdout=fd)
     try:
       for data in source:
@@ -274,8 +276,8 @@ def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
     # Ask the parent to write the passphrase for openssl below.
     passphrase_requester()
     p = subprocess.Popen(
-        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-d', '-pass',
-         'fd:%d' % passphrase_fd),
+        ('openssl', 'enc', '-aes-256-cbc', '-salt', '-md', 'md5', '-d',
+         '-pass', 'fd:%d' % passphrase_fd),
         stdin=fd, stdout=subprocess.PIPE)
     try:
       plaintext = []
