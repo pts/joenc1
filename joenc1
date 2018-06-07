@@ -5,10 +5,9 @@
 
 type python2.7 >/dev/null 2>&1 && exec python2.7 -- "$0" ${1+"$@"}
 type python2.6 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
-type python2.5 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
-type python2.4 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
-exec python -- ${1+"$@"}
-exit 1
+type python2.5 >/dev/null 2>&1 && exec python2.5 -- "$0" ${1+"$@"}
+type python2.4 >/dev/null 2>&1 && exec python2.4 -- "$0" ${1+"$@"}
+exec python -- ${1+"$@"}; exit 1
 
 Requirements: Python (2.4, 2.5, 2.6 or 2.7; doesn't work with 3.x) and the
 openssl(1) command-line tool. For SSH keys, a running ssh-agent is also
