@@ -994,6 +994,11 @@ def main(argv):
   else:
     encfile = argv[i]
     encfile_i = i
+    i += 1
+  if (do_encrypt or do_decrypt) and i < len(argv):
+    print >>sys.stderr, 'error: too many command-line arguments'
+    ShowUsage(argv)
+    sys.exit(1)
   dosum = do_create + do_encrypt + do_decrypt + do_create_with_key
   do_run_joe = not dosum
   if do_run_joe + dosum != 1:
