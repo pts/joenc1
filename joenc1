@@ -962,28 +962,36 @@ def main(argv):
   do_encrypt = False
   do_decrypt = False
   do_create_with_key = False
+  action_count = 0
   key_to_add = None
   i = 1
   while i < len(argv):
     arg = argv[i]
-    if arg in ('-create', '--create'):
-      do_create = True
-    elif arg in ('-encrypt', '--encrypt'):
-      do_encrypt = True
-    elif arg in ('-decrypt', '--decrypt'):
-      do_decrypt = True
-    elif arg in ('-create-with-key', '--create-with-key') and (
-        i + 1 < len(argv)):
-      do_create_with_key = True
-      i += 1
-      key_to_add = argv[i]
-    elif arg == '--':
+    if arg == '--':
       i += 1
       break
     elif not arg.startswith('-') or arg == '-':
       break
-    elif do_create or do_encrypt or do_decrypt or do_create_with_key:
+    arg = '--' + arg.lstrip('-')
+    if arg == '--create':
+      do_create = True
+      action_count += 1
+    elif arg == '--encrypt':
+      do_encrypt = True
+      action_count += 1
+    elif arg == '--decrypt':
+      do_decrypt = True
+      action_count += 1
+    elif arg == '--create-with-key' and i + 1 < len(argv):
+      do_create_with_key = do_create = True
+      i += 1
+      key_to_add = argv[i]
+    elif action_count:
       print >>sys.stderr, 'error: unknown flag: %s' % arg
+      ShowUsage(argv)
+      sys.exit(1)
+    if action_count > 1:
+      print >>sys.stderr, 'error: multiple action flags specified'
       ShowUsage(argv)
       sys.exit(1)
     i += 1
@@ -999,18 +1007,11 @@ def main(argv):
     encfile = argv[i]
     encfile_i = i
     i += 1
-  dosum = do_create + do_encrypt + do_decrypt + do_create_with_key
-  do_run_joe = not dosum
-  if dosum and i < len(argv):
+  do_run_joe = not action_count
+  if action_count and i < len(argv):
     print >>sys.stderr, 'error: too many command-line arguments'
     ShowUsage(argv)
     sys.exit(1)
-  if do_run_joe + dosum != 1:
-    print >>sys.stderr, 'error: invalid combination of action flags'
-    ShowUsage(argv)
-    sys.exit(1)
-  if do_create_with_key:
-    do_create = True
   #if key_to_add is not None:
   if encfile == '-':
     if do_encrypt:
