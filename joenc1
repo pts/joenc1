@@ -169,8 +169,8 @@ def WriteAll(fd, output):
   #os.write(1, 'READ FILE TO JOE')
 
 
-def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd,
-               is_ssh_only):
+def Encrypt(encfile_or_fd, source, passphrase_requester, passphrase_fd,
+            is_ssh_only):
   """Write encrypted version of source to encfile.
 
   Returns:
@@ -185,7 +185,10 @@ def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd,
   passphrase_requester()
   # TODO(pts): To prevent data loss, create a temporary file, write to it,
   # and move it on success. Also add O_CREAT.
-  fd = os.open(encfile, os.O_WRONLY | os.O_TRUNC, 0644)
+  if isinstance(encfile_or_fd, int):
+    fd = encfile_or_fd
+  else:
+    fd = os.open(encfile, os.O_WRONLY | os.O_TRUNC, 0644)
   size = 0
   try:
     # Write the header.
@@ -218,18 +221,19 @@ def WriteCrypt(encfile, source, passphrase_requester, passphrase_fd,
     assert 32 == os.write(fd, header)
     return size
   finally:
-    os.close(fd)
+    if not isinstance(encfile_or_fd, int):
+      os.close(fd)
 
 
-class ReadCryptError(Error):
+class DecryptError(Error):
   """Raised on a crypto error when reading an encrypted file."""
 
 
-class ReadCryptOpensslError(ReadCryptError):
+class DecryptOpensslError(DecryptError):
   """Raised when openssl has failed decrypting."""
 
 
-class ReadCryptHmacError(ReadCryptError):
+class DecryptHmacError(DecryptError):
   """Raised at a HMAC mismatch when decrypting."""
 
 
@@ -256,11 +260,16 @@ def IsHeaderOk(header):
       header.startswith(HEADER_START_SSHONLY))
 
 
-def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
+def Decrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext,
+            header=None):
   """Read and decrypt encfile, return the full plaintext."""
-  fd = os.open(encfile, os.O_RDONLY)
+  if isinstance(encfile, int):
+    fd = encfile
+  else:
+    fd = os.open(encfile, os.O_RDONLY)
   try:
-    header = os.read(fd, 32)
+    if header is None:
+      header = os.read(fd, 32)
     if not header:
       return ''
     if not IsHeaderOk(header):
@@ -294,13 +303,14 @@ def ReadCrypt(encfile, passphrase_requester, passphrase_fd, need_plaintext):
     if expected_hmac != got_hmac:
       # Don't write anything until hmac is proven correct.
       # We may also display an OpenSSL error above.
-      raise ReadCryptHmacError
+      raise DecryptHmacError
     if exit_code:
-      raise ReadCryptOpensslError(
+      raise DecryptOpensslError(
           'openssl decrypt failed with exit_code=%r' % exit_code)
     return ''.join(plaintext)
   finally:
-    os.close(fd)
+    if not isinstance(encfile, int):
+      os.close(fd)
 
 
 def JoeFileWorker(np_write_fd, passphrase_fd, encfile, is_ssh_only):
@@ -314,13 +324,13 @@ def JoeFileWorker(np_write_fd, passphrase_fd, encfile, is_ssh_only):
     st0 = os.fstat(0)
     st1 = os.fstat(1)
     if stat.S_ISFIFO(st1.st_mode) and not stat.S_ISFIFO(st0.st_mode):
-      WriteAll(1, ReadCrypt(encfile, passphrase_requester, passphrase_fd,
+      WriteAll(1, Decrypt(encfile, passphrase_requester, passphrase_fd,
                True))
     elif stat.S_ISFIFO(st0.st_mode) and not stat.S_ISFIFO(st1.st_mode):
       # TODO(pts): Better write error handling.
       #open('save.dat', 'w').write(time.ctime() + '\n' + sys.stdin.read())
-      WriteCrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd,
-                 is_ssh_only)
+      Encrypt(encfile, FdSource(0), passphrase_requester, passphrase_fd,
+              is_ssh_only)
       # TODO(pts): Better error reporting on assertion failure here.
     else:
       assert 0, 'error: invalid pipe invocation'
@@ -873,14 +883,14 @@ def VerifyEncrypted(encfile, passphrasen):
                 fcntl.fcntl(pp_write_fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
     passphrase_requester = InstantPassphraseRequester(pp_write_fd, passphrasen)
     try:
-      ReadCrypt(encfile, passphrase_requester, passphrase_fd, False)
-    except ReadCryptHmacError:  # TODO(pts): Remove code duplication.
+      Decrypt(encfile, passphrase_requester, passphrase_fd, False)
+    except DecryptHmacError:  # TODO(pts): Remove code duplication.
       # This doesn't always detect the failure, sometimes it just decrypts
       # the wrong data, that's why we have integrity protection with the
       # hmac above.
       print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
       sys.exit(5)
-    except ReadCryptOpensslError:  # TODO(pts): Remove code duplication.
+    except DecryptOpensslError:  # TODO(pts): Remove code duplication.
       # In addition to this error, the `openssl' command may also display a
       # decryption error above. But it doesn't always do so.
       print >>sys.stderr, 'error: hmac mismatch (bad passphrase?): %s' % (
@@ -948,7 +958,6 @@ def main(argv):
     ShowUsage(argv)
     sys.exit(0)
 
-  do_run_joe = None
   do_create = False  # Do create if doesn't exist, don't start joe.
   do_encrypt = False
   do_decrypt = False
@@ -979,10 +988,9 @@ def main(argv):
     ShowUsage(argv)
     sys.exit(1)
   dosum = do_create + do_encrypt + do_decrypt + do_create_with_key
-  if do_run_joe is None:
-    do_run_joe = not dosum
+  do_run_joe = not dosum
   if do_run_joe + dosum != 1:
-    print >>sys.stder, 'error: invalid combination of action flags'
+    print >>sys.stderr, 'error: invalid combination of action flags'
     ShowUsage(argv)
     sys.exit(1)
   if do_create_with_key:
@@ -990,34 +998,51 @@ def main(argv):
   #if key_to_add is not None:
 
   encfile = argv[i]
+  if encfile == '-' and not (do_encrypt or do_decrypt):
+    print >>sys.stderr, 'error: cannot use stding for this action'
+    ShowUsage(argv)
+    sys.exit(1)
   encfile_i = i
-  is_new = False
-  try:
-    ste = os.stat(encfile)
-  except OSError, e:
-    if e[0] == errno.ENOENT and do_create:
-      fd = os.open(encfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0644)
-      try:
-        ste = os.fstat(fd)
-      finally:
-        os.close(fd)
-      is_new = True
-    else:
-      if e[0] == errno.ENOENT:
-        e = encfile
-      print >>sys.stderr, (
-          'error: encfile not found, create it: %s --create %s' %
-          (argv[0], encfile))
-      sys.exit(2)
-  if not stat.S_ISREG(ste.st_mode):
-    print >>sys.stderr, 'error: encfile is not a regular file: %s' % encfile
-    sys.exit(2)
 
-  fd = os.open(encfile, os.O_RDONLY)
-  try:
-    header = os.read(fd, 32)
-  finally:
-    os.close(fd)
+
+  if encfile == '-':
+    encfile_or_fd = 0
+    if do_encrypt:
+      header = None
+    else:
+      header = os.read(encfile_or_fd, 32)
+  else:
+    encfile_or_fd = encfile
+    is_new = False
+    try:
+      ste = os.stat(encfile)
+    except OSError, e:
+      if e[0] == errno.ENOENT and (do_create or do_encrypt):
+        fd = os.open(encfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0644)
+        try:
+          ste = os.fstat(fd)
+        finally:
+          os.close(fd)
+        is_new = True
+      elif do_decrypt:
+        print >>sys.stderr, 'error: encfile not found: %s' % encfile
+        sys.exit(2)
+      else:
+        print >>sys.stderr, (
+            'error: encfile not found, create it: %s --create %s' %
+            (argv[0], encfile))
+        sys.exit(2)
+    if not stat.S_ISREG(ste.st_mode):
+      print >>sys.stderr, 'error: encfile is not a regular file: %s' % encfile
+      sys.exit(2)
+    fd = os.open(encfile, os.O_RDONLY)
+    try:
+      header = os.read(fd, 32)
+    finally:
+      if do_decrypt:
+        encfile_or_fd = fd
+      else:
+        os.close(fd)
   if header:  # Non-empty file.
     if header == HEADER_IN_PROGRESS:
       # TODO(pts): Make sure this can't happen, do autorecovery.
@@ -1154,10 +1179,14 @@ def main(argv):
   if signature is None:
     CheckNotSshOnly(is_ssh_only, encfile)
     if not header:
-      if is_new:
+      if encfile == '-':
+        prompt = 'joenc1 encrypt passphrase of stdin: '
+      elif is_new:
         prompt = 'joenc1 new passphrase of new %r: ' % encfile
       else:
         prompt = 'joenc1 new passphrase of empty %r: ' % encfile
+    elif encfile == '-':
+      prompt = 'joenc1 decrypt passphrase of stdin: '
     else:
       prompt = 'joenc1 passphrase of %r: ' % encfile
     passphrase = PromptPassphrase(prompt)
@@ -1190,22 +1219,28 @@ def main(argv):
   passphrase_requester = InstantPassphraseRequester(pp_write_fd, passphrasen)
 
   if not header and (do_create or do_run_joe):
-    WriteCrypt(encfile, (), passphrase_requester, passphrase_fd, is_ssh_only)
+    Encrypt(encfile, (), passphrase_requester, passphrase_fd, is_ssh_only)
     print >>sys.stderr, 'info: created with empty plaintext: %s' % encfile
 
   try:
     if do_decrypt:
       # Don't write anything until verified.
-      plaintext = ReadCrypt(encfile, passphrase_requester, passphrase_fd, True)
+      plaintext = Decrypt(encfile_or_fd, passphrase_requester,
+                          passphrase_fd, True, header=header)
       WriteAll(1, plaintext)
+    elif do_encrypt and encfile == '-':
+      pass
     else:
-      ReadCrypt(encfile, passphrase_requester, passphrase_fd, False)
-  except ReadCryptHmacError:
+      # We decrypt first even with do_encrypt, to verify that that
+      # passphrase is correct for a possibly preexisting encfile.
+      # !! do_encrypt?
+      Decrypt(encfile, passphrase_requester, passphrase_fd, False)
+  except DecryptHmacError:
     # This doesn't always detect the failure, sometimes it just decrypts the
     # wrong data, that's why we have integrity protection with the hmac above.
     print >>sys.stderr, 'error: decryption failed (bad passphrase?)'
     sys.exit(5)
-  except ReadCryptOpensslError:
+  except DecryptOpensslError:
     # In addition to this error, the `openssl' command may also display a
     # decryption error above. But it doesn't always do so.
     print >>sys.stderr, 'error: hmac mismatch (bad passphrase?): %s' % (
@@ -1220,8 +1255,12 @@ def main(argv):
       print >>sys.stderr, 'info: encfile verified OK, kept intact: %s' % (
           encfile)
   elif do_encrypt:
-    size = WriteCrypt(encfile, FdSource(0), passphrase_requester,
-                      passphrase_fd, is_ssh_only)
+    if encfile == '-':
+      encfile_or_fd = 1
+    else:
+      encfile_or_fd = encfile
+    size = Encrypt(encfile_or_fd, FdSource(0), passphrase_requester,
+                   passphrase_fd, is_ssh_only)
     print >>sys.stderr, 'info: encrypted %d plaintext bytes to: %s' % (
         size, encfile)
 
