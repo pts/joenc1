@@ -1008,17 +1008,20 @@ def main(argv):
   if do_create_with_key:
     do_create = True
   #if key_to_add is not None:
-  if encfile == '-' and not (do_encrypt or do_decrypt):
-    print >>sys.stderr, 'error: cannot use stding for this action'
-    ShowUsage(argv)
-    sys.exit(1)
-
   if encfile == '-':
-    encfile_or_fd = 0
     if do_encrypt:
+      if os.isatty(1):
+        print >>sys.stderr, 'error: refusing to write encrypted data to stdout'
+        sys.exit(10)
       header = None
-    else:
+      encfile_or_fd = 1
+    elif do_decrypt:
+      encfile_or_fd = 0
       header = os.read(encfile_or_fd, 32)
+    else:
+      print >>sys.stderr, 'error: cannot use stding for this action'
+      ShowUsage(argv)
+      sys.exit(1)
   else:
     encfile_or_fd = encfile
     is_new = False
@@ -1263,10 +1266,6 @@ def main(argv):
       print >>sys.stderr, 'info: encfile verified OK, kept intact: %s' % (
           encfile)
   elif do_encrypt:
-    if encfile == '-':
-      encfile_or_fd = 1
-    else:
-      encfile_or_fd = encfile
     size = Encrypt(encfile_or_fd, FdSource(0), passphrase_requester,
                    passphrase_fd, is_ssh_only)
     print >>sys.stderr, 'info: encrypted %d plaintext bytes to: %s' % (
