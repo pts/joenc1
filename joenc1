@@ -351,8 +351,8 @@ def JoeFileWorker(np_write_fd, passphrase_fd, encfile, is_ssh_only):
 
 def ShowUsage(argv):
   doc = re.sub(r'\A(?::" # ?)?', '', __doc__.strip())
-  doc = re.sub(r'(?s)\ntype python.*?\n\n', '', doc, 1)
-  print >>sys.stderr, ('%s\n\n%s' % (argv[0], doc))  # Module docstring.
+  doc = re.sub(r'(?s)\ntype python.*?\n\n', '\n', doc, 1)
+  print >>sys.stderr, doc  # Module docstring.
 
 
 def QuoteShellWord(word):
