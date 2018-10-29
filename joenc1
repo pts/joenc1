@@ -984,9 +984,16 @@ def main(argv):
       break
     i += 1
   if i >= len(argv):
-    print >>sys.stderr, 'error: encfile not specified'
-    ShowUsage(argv)
-    sys.exit(1)
+    if do_encrypt or do_decrypt:
+      encfile = '-'
+      encfile_i = None
+    else:
+      print >>sys.stderr, 'error: encfile not specified'
+      ShowUsage(argv)
+      sys.exit(1)
+  else:
+    encfile = argv[i]
+    encfile_i = i
   dosum = do_create + do_encrypt + do_decrypt + do_create_with_key
   do_run_joe = not dosum
   if do_run_joe + dosum != 1:
@@ -996,14 +1003,10 @@ def main(argv):
   if do_create_with_key:
     do_create = True
   #if key_to_add is not None:
-
-  encfile = argv[i]
   if encfile == '-' and not (do_encrypt or do_decrypt):
     print >>sys.stderr, 'error: cannot use stding for this action'
     ShowUsage(argv)
     sys.exit(1)
-  encfile_i = i
-
 
   if encfile == '-':
     encfile_or_fd = 0
