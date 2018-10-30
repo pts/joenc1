@@ -171,7 +171,7 @@ def WriteAll(fd, output):
 
 def Encrypt(encfile_or_fd, source, passphrase_requester, passphrase_fd,
             is_ssh_only):
-  """Write encrypted version of source to encfile.
+  """Write encrypted version of source to encfile_or_fd.
 
   Returns:
     The number of plaintext bytes written.
@@ -188,7 +188,7 @@ def Encrypt(encfile_or_fd, source, passphrase_requester, passphrase_fd,
   if isinstance(encfile_or_fd, int):
     fd = encfile_or_fd
   else:
-    fd = os.open(encfile, os.O_WRONLY | os.O_TRUNC, 0644)
+    fd = os.open(encfile_or_fd, os.O_WRONLY | os.O_TRUNC, 0644)
   size = 0
   try:
     # Write the header.
