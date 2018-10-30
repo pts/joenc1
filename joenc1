@@ -1032,6 +1032,8 @@ def Mount(data):
     cmd.extend(items)
     cmd_str = ' '.join(map(pipes.quote, cmd))
     print >>sys.stderr, 'info: running hdparm_cmd: %s' % cmd_str
+    # TODO(pts): Don't run the command (it wakes up the sleeping drive) if
+    # the device was not affected by dmsetup or mount.
     p = subprocess.Popen(cmd)
     exit_code = p.wait()
     # TODO(pts): Allow failure if SATA command not supported.
