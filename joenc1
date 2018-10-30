@@ -943,6 +943,206 @@ def CheckNotSshOnly(is_ssh_only, encfile):
     sys.exit(15)
 
 
+def Mount(data):
+  """Finds and executes all mount-like commands in data."""
+
+  import os
+  import pipes
+  import re
+  import signal
+  import subprocess
+  import sys
+
+  word_re = re.compile(r'\w+\Z')
+  wordarg_re = re.compile(r'\w[-+\w]*\Z')
+  uuid_re = re.compile(r'[0-9a-f]{8}-(?:[0-9a0-f]{4}-){3}[0-9a-f]{12}\Z')
+  uuid_dir = '/dev/disk/by-uuid/'
+  mapper_dir = '/dev/mapper/'
+
+  # Redirect stdin to /dev/null, to prevent password prompts etc.
+  fd = os.open('/dev/null', os.O_RDONLY)
+  if fd != 0:
+    os.dup2(fd, 0)
+    os.close(fd)
+  signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+  def ScanMounts():
+     mounts = {}
+     f = open('/proc/mounts')
+     try:
+       for line in f:
+         items = line.rstrip('\n').split()
+         if len(items) >= 2 and items[0].startswith('/dev/'):
+           mounts[items[0]] = items[1]
+     finally:
+       f.close()
+     return mounts
+
+  def ScanUuids():
+    uuids = {}
+    has_dm = False
+    for uuid in os.listdir(uuid_dir):
+      if not uuid_re.match(uuid):
+        continue
+      try:
+        target = os.readlink(uuid_dir + uuid)
+      except OSError:
+        continue
+      if target.startswith('../../'):
+        target = '/dev/' + target[6:]
+      if target.startswith('/dev/dm'):
+        has_dm = True
+      uuids[uuid] = target
+    if has_dm:
+      dm_rnames = {}
+      for dmsetup_name in os.listdir(mapper_dir):
+        if not wordarg_re.match(dmsetup_name):
+          continue
+        dmsetup_pathname = mapper_dir + dmsetup_name
+        try:
+          target = os.readlink(dmsetup_pathname)
+        except OSError:
+          continue
+        if target.startswith('../'):
+          target = '/dev/' + target[3:]
+        dm_rnames[target] = dmsetup_pathname
+      # Example dm_rnames: {'/dev/dm-0': '/dev/mapper/name'}.
+      for uuid, target in sorted(uuids.iteritems()):
+        if target in dm_rnames:
+          uuids[uuid] = dm_rnames[target]
+    return uuids
+
+  def RunDmsetupCreate(dmsetup_name, stdin_data):
+    cmd = ('sudo', 'dmsetup', 'create', dmsetup_name)
+    cmd_str = ' '.join(map(pipes.quote, cmd))
+    print >>sys.stderr, 'info: running dmsetup_create_cmd: %s' % cmd_str
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+      p.stdin.write(stdin_data)
+      p.stdin.close()
+    finally:
+      exit_code = p.wait()
+    if exit_code:
+      print >>sys.stderr, (
+          'error: dmsetup_create_cmd failed with exit code %d' % exit_code)
+      sys.exit(12)
+
+  def RunHdparm(items):
+    cmd = ['sudo', 'hdparm']
+    cmd.extend(items)
+    cmd_str = ' '.join(map(pipes.quote, cmd))
+    print >>sys.stderr, 'info: running hdparm_cmd: %s' % cmd_str
+    p = subprocess.Popen(cmd)
+    exit_code = p.wait()
+    # TODO(pts): Allow failure if SATA command not supported.
+    if exit_code:
+      print >>sys.stderr, (
+          'error: hdparm_cmd failed with exit code %d' % exit_code)
+      sys.exit(13)
+
+  def RunMount(items, target_dir):
+    cmd = ['sudo', 'mount']
+    cmd.extend(items)
+    cmd.append(target_dir)
+    cmd_str = ' '.join(map(pipes.quote, cmd))
+    if not os.path.isdir(target_dir):
+      print >>sys.stderr, (
+          'info: creating target dir for mount_cmd: %s' % cmd_str)
+      mkdir_cmd = ('sudo', 'mkdir', '-m', '755', '-p', target_dir)
+      mkdir_cmd_str = ' '.join(map(pipes.quote, mkdir_cmd))
+      print >>sys.stderr, 'info: running mkdir_cmd: %s' % mkdir_cmd_str
+      p = subprocess.Popen(mkdir_cmd)
+      exit_code = p.wait()
+      if exit_code:
+        print >>sys.stderr, (
+            'error: mkdir_cmd failed with exit code %d' % exit_code)
+        sys.exit(14)
+      # TODO(pts): Create not_mounted file, with 0644 permissions (precmd).
+    print >>sys.stderr, 'info: running mount_cmd: %s' % cmd_str
+    p = subprocess.Popen(cmd)
+    exit_code = p.wait()
+    if exit_code:
+      print >>sys.stderr, (
+          'error: mount_cmd failed with exit code %d' % exit_code)
+      sys.exit(15)
+
+  dmsetup_name = None
+  uuids = mounts = None
+  for line in data.splitlines():
+    items = line.split()
+    if (len(items) >= 4 and
+        items[0] == '$' and
+        wordarg_re.match(items[-1]) and
+        items[-2] == 'create' and
+        items[-3] == 'dmsetup' and
+        (len(items) >= 5 and items[-4] == 'sudo' and items[-5] in ('|', '$') or
+         items[-4] in ('|', '$'))):
+      dmsetup_name = items[-1]
+      continue
+    if (dmsetup_name and len(items) > 4 and items[2] == 'crypt' and
+        items[-2].startswith(uuid_dir) and
+        uuid_re.match(items[-2][len(uuid_dir):])):
+      if uuids is None:
+        uuids = ScanUuids()
+      uuid = items[-2][len(uuid_dir):]
+      if uuid in uuids:
+        dmsetup_pathname = mapper_dir + dmsetup_name
+        if sum(1 for target in uuids.itervalues() if target == dmsetup_pathname):
+          print >>sys.stderr, (
+              'info: dm device found, skipping dmsetup create: %s' %
+              dmsetup_name)
+        else:
+          RunDmsetupCreate(dmsetup_name, ' '.join(items) + '\n')
+          uuids = None  # Invalidate cache.
+      dmsetup_name = None
+      continue
+    dmsetup_name = None
+    if '#' in items:
+      del items[items.index('#'):]
+    if (len(items) > 3 and
+        items[0] == '$' and
+        items[1] == 'sudo' and
+        items[2] == 'hdparm' and
+        items[-1].startswith(uuid_dir) and
+        uuid_re.match(items[-1][len(uuid_dir):])):
+      uuid = items[-1][len(uuid_dir):]
+      if uuids is None:
+        uuids = ScanUuids()
+      if uuid in uuids:
+        RunHdparm(items[3:])
+      continue
+    if (len(items) > 4 and
+        items[0] == '$' and
+        items[1] == 'sudo' and
+        items[2] == 'mount' and
+        items[-1].startswith('/') and
+        items[-2].startswith(uuid_dir) and
+        uuid_re.match(items[-2][len(uuid_dir):])):
+      uuid = items[-2][len(uuid_dir):]
+      target_dir = items[-1]
+      if uuids is None:
+        uuids = ScanUuids()
+      if uuid in uuids:
+        if mounts is None:
+          mounts = ScanMounts()
+        # Typically uuids[uuid] is /dev/mapper/... in /proc, even if we
+        # we have mounted the device as /dev/disk/... .
+        dev_pathnames = (uuid_dir + uuid, uuids[uuid])
+        if sum(1 for dev_pathname1 in sorted(mounts)
+               if dev_pathname1 in dev_pathnames):
+          print >>sys.stderr, 'info: device already mounted, skipping: %s' % (
+              uuid_dir + uuid)
+        elif sum(1 for target_dir1 in sorted(mounts.itervalues())
+                 if target_dir1 == target_dir):
+          print >>sys.stderr, (
+              'info: target_dir already mounted, skipping: %s' % target_dir)
+        else:
+          RunMount(items[3 : -1], target_dir)
+          mounts = None  # Invalidate cache.
+          print >>sys.stderr, 'info: mount OK: %s' % target_dir
+      continue
+
+
 def main(argv):
   if (os.getenv('JOENC1_FILE_WORKER', None) is not None and
       len(sys.argv) == 2):
@@ -962,6 +1162,7 @@ def main(argv):
   do_encrypt = False
   do_decrypt = False
   do_create_with_key = False
+  do_mount = False
   action_count = 0
   key_to_add = None
   i = 1
@@ -982,6 +1183,9 @@ def main(argv):
     elif arg == '--decrypt':
       do_decrypt = True
       action_count += 1
+    elif arg == '--mount':
+      do_mount = True
+      action_count += 1
     elif arg == '--create-with-key' and i + 1 < len(argv):
       do_create_with_key = do_create = True
       i += 1
@@ -996,7 +1200,7 @@ def main(argv):
       sys.exit(1)
     i += 1
   if i >= len(argv):
-    if do_encrypt or do_decrypt:
+    if do_encrypt or do_decrypt or do_mount:
       encfile = '-'
       encfile_i = None
     else:
@@ -1020,7 +1224,7 @@ def main(argv):
         sys.exit(10)
       header = None
       encfile_or_fd = 1
-    elif do_decrypt:
+    elif do_decrypt or do_mount:
       encfile_or_fd = 0
       header = os.read(encfile_or_fd, 32)
     else:
@@ -1040,7 +1244,7 @@ def main(argv):
         finally:
           os.close(fd)
         is_new = True
-      elif do_decrypt:
+      elif do_decrypt or do_mount:
         print >>sys.stderr, 'error: encfile not found: %s' % encfile
         sys.exit(2)
       else:
@@ -1055,7 +1259,7 @@ def main(argv):
     try:
       header = os.read(fd, 32)
     finally:
-      if do_decrypt:
+      if do_decrypt or do_mount:
         encfile_or_fd = fd
       else:
         os.close(fd)
@@ -1223,7 +1427,7 @@ def main(argv):
       del passphrase_again
     del passphrase
   else:
-    if not do_decrypt:
+    if not (do_decrypt or do_mount):
       print >>sys.stderr, 'info: using RSA key'
     passphrasen = PreprocessRsaSignature(signature, fixup)
 
@@ -1239,17 +1443,19 @@ def main(argv):
     print >>sys.stderr, 'info: created with empty plaintext: %s' % encfile
 
   try:
-    if do_decrypt:
+    if do_decrypt or do_mount:
       # Don't write anything until verified.
       plaintext = Decrypt(encfile_or_fd, passphrase_requester,
                           passphrase_fd, True, header=header)
-      WriteAll(1, plaintext)
+      if do_mount:
+        Mount(plaintext)
+      else:
+        WriteAll(1, plaintext)
     elif do_encrypt and encfile == '-':
       pass
     else:
       # We decrypt first even with do_encrypt, to verify that that
       # passphrase is correct for a possibly preexisting encfile.
-      # !! do_encrypt?
       Decrypt(encfile, passphrase_requester, passphrase_fd, False)
   except DecryptHmacError:
     # This doesn't always detect the failure, sometimes it just decrypts the
